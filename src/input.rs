@@ -1,15 +1,21 @@
 use memchr::{memchr, memchr_iter};
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 
 use rustc_hash::{FxHashMap as Map, FxHasher};
-use std::{fs, fs::File, hash::Hasher, path::Path};
+use std::{
+    fs,
+    fs::File,
+    hash::Hasher,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub type Text<'a> = &'a [u8];
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 
-pub fn load(path: &Path) -> Vec<Mmap> {
-    let paths = if path.is_dir() {
+fn csv_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_dir() {
         fs::read_dir(path)
             .unwrap()
             .map(|p| p.unwrap().path())
@@ -17,8 +23,10 @@ pub fn load(path: &Path) -> Vec<Mmap> {
             .collect()
     } else {
         vec![path.to_path_buf()]
-    };
-    paths
+    }
+}
+pub fn load(path: &Path) -> Vec<Mmap> {
+    csv_files(path)
         .into_iter()
         .filter_map(|p| {
             let f = File::open(p).unwrap();
@@ -29,6 +37,49 @@ pub fn load(path: &Path) -> Vec<Mmap> {
             Some(unsafe { Mmap::map(&f).unwrap() })
         })
         .collect()
+}
+
+pub struct FileWindow {
+    file: Arc<File>,
+    offset: usize,
+    pub bytes: usize,
+}
+impl FileWindow {
+    pub fn read(&self) -> Mmap {
+        // The read-only contest inputs remain immutable for the entire invocation.
+        unsafe {
+            MmapOptions::new()
+                .offset(self.offset as u64)
+                .len(self.bytes)
+                .map(self.file.as_ref())
+                .unwrap()
+        }
+    }
+}
+pub fn windows(path: &Path) -> Vec<FileWindow> {
+    let mut windows = Vec::new();
+    for path in csv_files(path) {
+        let file = Arc::new(File::open(path).unwrap());
+        if file.metadata().unwrap().len() == 0 {
+            continue;
+        }
+        // Touch only the header and the newline near each nominal boundary.
+        let sample = unsafe { Mmap::map(file.as_ref()).unwrap() };
+        let Some(mut start) = memchr(b'\n', &sample).map(|i| i + 1) else {
+            continue;
+        };
+        while start < sample.len() {
+            let target = (start + 2 * 1024 * 1024).min(sample.len());
+            let end = memchr(b'\n', &sample[target..]).map_or(sample.len(), |n| target + n + 1);
+            windows.push(FileWindow {
+                file: file.clone(),
+                offset: start,
+                bytes: end - start,
+            });
+            start = end;
+        }
+    }
+    windows
 }
 
 pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
@@ -197,7 +248,7 @@ pub fn read_pairs(files: &[Mmap]) -> Map<Text<'_>, Text<'_>> {
     m
 }
 
-pub fn linked<'a>(files: &'a [Mmap], codec: &crate::Names<'a>) -> Map<u64, u64> {
+pub fn linked(files: &[Mmap], codec: &crate::Names) -> Map<u64, u64> {
     use rayon::prelude::*;
     let edges: Vec<_> = chunks(files)
         .into_par_iter()

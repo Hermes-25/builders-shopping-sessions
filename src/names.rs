@@ -1,13 +1,16 @@
 use crate::{Map, Text};
-use std::{cmp::Ordering, sync::Mutex};
+use std::{
+    cmp::Ordering,
+    sync::{Arc, Mutex},
+};
 const EXTERNAL: u64 = 1 << 63;
 const HIGH: u64 = 0x8080808080808080;
 const ONES: u64 = 0x0101010101010101;
-type Dictionary<'a> = (Map<Text<'a>, u64>, Vec<Text<'a>>);
+type Dictionary = (Map<Arc<[u8]>, u64>, Vec<Arc<[u8]>>);
 
 #[derive(Default)]
-pub struct Names<'a> {
-    dictionaries: [Mutex<Dictionary<'a>>; 32],
+pub struct Names {
+    dictionaries: [Mutex<Dictionary>; 32],
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -16,9 +19,9 @@ unsafe fn pack_eight(word: u64) -> u64 {
     std::arch::x86_64::_pext_u64(word, !HIGH)
 }
 
-impl<'a> Names<'a> {
+impl Names {
     #[inline]
-    pub fn encode(&self, name: Text<'a>) -> u64 {
+    pub fn encode(&self, name: Text<'_>) -> u64 {
         // Big-endian seven-bit digits retain lexicographic order. Zero padding
         // distinguishes lengths, so actual NUL bytes use the exact dictionary.
         let n = name.len();
@@ -45,20 +48,23 @@ impl<'a> Names<'a> {
     }
 
     #[cold]
-    fn intern_long(&self, name: Text<'a>) -> u64 {
+    fn intern_long(&self, name: Text<'_>) -> u64 {
         let bucket = crate::input::signature(name) % 32;
         let mut guard = self.dictionaries[bucket].lock().unwrap();
         let (map, names) = &mut *guard;
-        *map.entry(name).or_insert_with(|| {
-            let key = EXTERNAL | ((names.len() as u64) << 5) | bucket as u64;
-            names.push(name);
-            key
-        })
+        if let Some(&key) = map.get(name) {
+            return key;
+        }
+        let key = EXTERNAL | ((names.len() as u64) << 5) | bucket as u64;
+        let owned: Arc<[u8]> = Arc::from(name);
+        names.push(owned.clone());
+        map.insert(owned, key);
+        key
     }
     pub fn append_plain(&self, key: u64, out: &mut Vec<u8>) {
         if key & EXTERNAL != 0 {
             let guard = self.dictionaries[(key & 31) as usize].lock().unwrap();
-            let bytes = guard.1[((key ^ EXTERNAL) >> 5) as usize];
+            let bytes = &guard.1[((key ^ EXTERNAL) >> 5) as usize];
             out.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
             out.extend_from_slice(bytes);
         } else {
@@ -99,8 +105,4 @@ impl<'a> Names<'a> {
 pub fn mixed(key: u64) -> usize {
     let x = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb) as usize
-}
-#[inline]
-pub fn partition(key: u64) -> usize {
-    mixed(key) >> 57
 }

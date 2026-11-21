@@ -10,8 +10,8 @@ mod timelines;
 
 use aliases::{Aliases, Router};
 use campaigns::CampaignGrid;
-use input::{DAY, Text, WEEK, chunks, decimal, linked, load, read_pairs, rows, timestamp};
-use names::{Names, partition};
+use input::{DAY, Text, WEEK, decimal, linked, load, read_pairs, rows, timestamp};
+use names::Names;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as Map;
 use std::{env, fs, path::PathBuf};
@@ -107,20 +107,30 @@ impl Window {
     }
 }
 
-fn sessions(
+struct Daily<'a> {
+    users: &'a mut Vec<UserDay>,
+    campaigns: &'a mut CampaignGrid,
+    categories: &'a mut [i64],
+    active: &'a mut Window,
+}
+fn sessions<V: timelines::OrderedVisit, A: timelines::AdData>(
     user: u64,
-    events: &[timelines::Visit],
-    clicks: &[timelines::Ad],
-    users: &mut Vec<UserDay>,
-    campaigns: &mut CampaignGrid,
-    categories: &mut [i64],
-    active: &mut Window,
+    events: &[V],
+    clicks: &[A],
+    lo: i64,
+    output: &mut Daily<'_>,
 ) {
+    let Daily {
+        users,
+        campaigns,
+        categories,
+        active,
+    } = output;
     let (mut left, mut right) = (0, 0);
     active.clear();
     let mut i = 0;
     while i < events.len() {
-        let ts = events[i].ts;
+        let ts = events[i].visit(lo).ts;
         let day = ts.div_euclid(DAY) as i32;
         if users.last().is_none_or(|r| r.user != user || r.day != day) {
             categories.fill(0);
@@ -134,17 +144,17 @@ fn sessions(
             });
         }
         let row = users.last_mut().unwrap();
-        while right < clicks.len() && clicks[right].ts <= ts {
-            active.add(clicks[right].campaign);
+        while right < clicks.len() && clicks[right].time(lo - WEEK) <= ts {
+            active.add(clicks[right].campaign());
             right += 1;
         }
-        while left < right && clicks[left].ts < ts - WEEK {
-            let campaign = clicks[left].campaign;
+        while left < right && clicks[left].time(lo - WEEK) < ts - WEEK {
+            let campaign = clicks[left].campaign();
             active.remove(campaign);
             left += 1;
         }
         let credit = if left < right {
-            clicks[right - 1].campaign
+            clicks[right - 1].campaign()
         } else {
             0
         };
@@ -154,8 +164,8 @@ fn sessions(
         let mut last = ts;
         let mut revenue = 0;
         let start = i;
-        while i < events.len() && events[i].ts - last <= 1_800_000 {
-            let e = events[i];
+        while i < events.len() && events[i].visit(lo).ts - last <= 1_800_000 {
+            let e = events[i].visit(lo);
             last = e.ts;
             if e.price > 0 {
                 let category = e.category;
@@ -227,13 +237,16 @@ fn main() {
         .skip(1)
         .map(|(i, &c)| (c, i as u32))
         .collect();
-    let es = load(&data.join("events"));
-    let cs = load(&data.join("clicks"));
+    let es = input::windows(&data.join("events"));
+    let cs = input::windows(&data.join("clicks"));
     let names = Names::default();
-    let aliases = Aliases::new(linked(&l, &names));
+    let aliases = Aliases::new(
+        linked(&l, &names),
+        es.iter().chain(&cs).map(|file| file.bytes).sum(),
+    );
     measure("catalogs and identities");
     let dates = dates::Dates::new(lo, hi);
-    let event_chunks = chunks(&es);
+    let event_chunks = es;
     let parcel: Vec<events::Parcel> = if hi - lo <= i64::from(u32::MAX) && labels.len() <= 256 {
         events::route::<events::Short>(
             event_chunks,
@@ -265,11 +278,12 @@ fn main() {
     };
     measure("event deduplication");
     let click_names = Names::default();
-    let click_parts: Vec<_> = chunks(&cs)
+    let click_parts: Vec<_> = cs
         .into_par_iter()
         .map(|chunk| {
+            let mapped = chunk.read();
             let mut grouped = Router::new(&aliases);
-            rows::<4>(chunk, |[id, user, campaign, raw]| {
+            rows::<4>(&mapped, |[id, user, campaign, raw]| {
                 let Some(&campaign) = campaign_ids.get(campaign) else {
                     return;
                 };
@@ -307,7 +321,7 @@ fn main() {
     let job_count = threads.saturating_mul(3).clamp(1, parcels.len());
     let mut jobs: Vec<Vec<_>> = (0..job_count).map(|_| Vec::new()).collect();
     for (i, p) in parcels.into_iter().enumerate() {
-        jobs[i % job_count].push(p);
+        jobs[i % job_count].push((i, p));
     }
     jobs.into_par_iter().enumerate().for_each(|(index, parts)| {
         let worker = rayon::current_thread_index().unwrap();
@@ -315,19 +329,14 @@ fn main() {
         let mut rows = Vec::new();
         let mut active = Window::new(campaigns.len());
         let mut category_sums = vec![0; labels.len()];
-        for (ev, cl) in parts {
-            let timelines = ev.timelines(cl, lo);
-            timelines.for_each(&click_names, |user, events, clicks| {
-                sessions(
-                    user,
-                    events,
-                    clicks,
-                    &mut rows,
-                    &mut totals,
-                    &mut category_sums,
-                    &mut active,
-                );
-            });
+        let mut output = Daily {
+            users: &mut rows,
+            campaigns: &mut totals,
+            categories: &mut category_sums,
+            active: &mut active,
+        };
+        for (part, (ev, cl)) in parts {
+            ev.reduce(part, cl, lo, hi, &aliases, &click_names, &mut output);
         }
         if index == 0 || !rows.is_empty() {
             bulk_parquet::write(
