@@ -48,6 +48,11 @@ pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
 }
 
 pub fn rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnMut([&'a [u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { vector_rows(chunk, process) };
+    }
+
     for line in memchr_iter(b'\n', chunk)
         .chain(std::iter::once(chunk.len()))
         .scan(0, |start, end| {
@@ -90,6 +95,17 @@ pub fn rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnMut([&'a [u
 pub fn decimal(s: &[u8], limit: i64) -> Option<i64> {
     if s.is_empty() {
         return None;
+    }
+    if s.len() <= 18 {
+        let mut v = 0;
+        for &c in s {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + i64::from(d);
+        }
+        return (v <= limit).then_some(v);
     }
     let mut v = 0i64;
     for &c in s {
@@ -178,46 +194,150 @@ pub fn read_pairs(files: &[Mmap]) -> Map<Text<'_>, Text<'_>> {
     m
 }
 
-fn root(parent: &mut [usize], mut i: usize) -> usize {
-    while parent[i] != i {
-        parent[i] = parent[parent[i]];
-        i = parent[i];
+pub fn linked<'a>(files: &'a [Mmap], codec: &crate::Names<'a>) -> Map<u64, u64> {
+    use rayon::prelude::*;
+    let edges: Vec<_> = chunks(files)
+        .into_par_iter()
+        .map(|chunk| {
+            let mut edges = Vec::new();
+            rows::<2>(chunk, |[a, b]| {
+                if a != b && !a.is_empty() && !b.is_empty() {
+                    edges.push((codec.encode(a), codec.encode(b)));
+                }
+            });
+            edges
+        })
+        .collect();
+    let n = edges.iter().map(Vec::len).sum::<usize>();
+    let mut id = Map::<u64, usize>::default();
+    id.reserve(n);
+    let mut parent = Vec::<usize>::with_capacity(n);
+    let mut minima = Vec::<u64>::with_capacity(n);
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while i != parent[i] {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
     }
-    i
-}
-
-pub fn linked(files: &[Mmap]) -> Map<Text<'_>, Text<'_>> {
-    let mut ids = Map::default();
-    let mut names = Vec::new();
-    let mut parent = Vec::new();
-    for c in chunks(files) {
-        rows::<2>(c, |[a, b]| {
-            if a.is_empty() || b.is_empty() {
-                return;
-            }
-            let mut intern = |s| {
-                *ids.entry(s).or_insert_with(|| {
-                    let i = parent.len();
-                    parent.push(i);
-                    names.push(s);
-                    i
-                })
-            };
-            let (x, y) = (intern(a), intern(b));
-            let (rx, ry) = (root(&mut parent, x), root(&mut parent, y));
-            if names[rx] < names[ry] {
-                parent[ry] = rx;
+    for (a, b) in edges.into_iter().flatten() {
+        let mut intern = |k| {
+            *id.entry(k).or_insert_with(|| {
+                let i = parent.len();
+                parent.push(i);
+                minima.push(k);
+                i
+            })
+        };
+        let (a, b) = (intern(a), intern(b));
+        let (a, b) = (find(&mut parent, a), find(&mut parent, b));
+        if a != b {
+            let (lo, hi) = if codec.cmp(minima[a], minima[b]).is_lt() {
+                (a, b)
             } else {
-                parent[rx] = ry;
-            }
-        });
+                (b, a)
+            };
+            parent[hi] = lo;
+        }
     }
-    for (i, name) in names.clone().into_iter().enumerate() {
-        ids.insert(name, root(&mut parent, i));
+    let mut resolved = Map::default();
+    resolved.reserve(id.len() / 2);
+    for (key, i) in id {
+        let name = minima[find(&mut parent, i)];
+        if key != name {
+            resolved.insert(key, name);
+        }
     }
-    ids.into_iter().map(|(name, i)| (name, names[i])).collect()
+    resolved
 }
 
-pub fn shard(key: &[u8]) -> usize {
-    signature(key) % 128
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vector_rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnMut([&'a [u8]; N])) {
+    use std::arch::x86_64::*;
+    let mut fields = [&[][..]; N];
+    let mut count = 0usize;
+    let mut quotes = 0u32;
+    let mut start = 0;
+    let mut valid = true;
+
+    let mut field = |end: usize, quoted: u32, line_end: bool| {
+        if count >= N {
+            valid = false;
+        } else {
+            let mut value = &chunk[start..end];
+            if quoted != 0 {
+                if quoted == 2
+                    && value.len() >= 2
+                    && value[0] == b'"'
+                    && value[value.len() - 1] == b'"'
+                {
+                    value = &value[1..value.len() - 1];
+                } else {
+                    valid = false;
+                }
+            }
+            fields[count] = value;
+        }
+        count += 1;
+        start = end + 1;
+        if line_end {
+            if valid && count == N {
+                process(fields);
+            }
+            valid = true;
+            count = 0;
+        }
+    };
+    let end = chunk.len() / 32 * 32;
+    for pos in (0..end).step_by(32) {
+        // Only complete blocks are loaded. The remainder is handled below.
+        let bytes = unsafe { _mm256_loadu_si256(chunk.as_ptr().add(pos).cast()) };
+        let comma = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b',' as i8));
+        let lf = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\n' as i8));
+        let quote = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8));
+        let mut ends = _mm256_movemask_epi8(_mm256_or_si256(comma, lf)) as u32;
+        let mut quote_mask = _mm256_movemask_epi8(quote) as u32;
+        while ends != 0 {
+            let bit = ends & ends.wrapping_neg();
+            let idx = pos + ends.trailing_zeros() as usize;
+            let prior = bit - 1;
+            quotes += (quote_mask & prior).count_ones();
+            field(idx, quotes, chunk[idx] == b'\n');
+            quotes = 0;
+            quote_mask &= !prior;
+            ends -= bit;
+        }
+        quotes += quote_mask.count_ones();
+    }
+    for (i, &c) in chunk[end..].iter().enumerate() {
+        match c {
+            b'"' => quotes += 1,
+            b',' | b'\n' => {
+                field(end + i, quotes, c == b'\n');
+                quotes = 0;
+            }
+            _ => {}
+        }
+    }
+    if chunk.last() != Some(&b'\n') {
+        field(chunk.len(), quotes, true);
+    }
+}
+
+// The input contract guarantees ingest_ts is a valid F1 timestamp.
+pub fn ingest_time(s: &[u8]) -> i64 {
+    #[inline]
+    fn two(s: &[u8], i: usize) -> i64 {
+        i64::from(s[i] - b'0') * 10 + i64::from(s[i + 1] - b'0')
+    }
+    let y = two(s, 0) * 100 + two(s, 2);
+    let m = two(s, 5);
+    let d = two(s, 8);
+    let y = y - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let r = y - era * 400;
+    let march = if m > 2 { m - 3 } else { m + 9 };
+    let days = era * 146097 + 365 * r + r / 4 - r / 100 + (153 * march + 2) / 5 + d - 1 - 719468;
+    days * DAY + ((two(s, 11) * 60 + two(s, 14)) * 60 + two(s, 17)) * 1000
 }

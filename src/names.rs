@@ -1,0 +1,92 @@
+use crate::{Map, Text};
+use std::{cmp::Ordering, sync::Mutex};
+const EXTERNAL: u64 = 1 << 63;
+const HIGH: u64 = 0x8080808080808080;
+const ONES: u64 = 0x0101010101010101;
+type Dictionary<'a> = (Map<Text<'a>, u64>, Vec<Text<'a>>);
+
+#[derive(Default)]
+pub struct Names<'a> {
+    dictionaries: [Mutex<Dictionary<'a>>; 32],
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn pack_eight(word: u64) -> u64 {
+    std::arch::x86_64::_pext_u64(word, !HIGH)
+}
+
+impl<'a> Names<'a> {
+    #[inline]
+    pub fn encode(&self, name: Text<'a>) -> u64 {
+        // Big-endian seven-bit digits retain lexicographic order. Zero padding
+        // distinguishes lengths, so actual NUL bytes use the exact dictionary.
+        let n = name.len();
+        if n == 8 || n == 9 {
+            let x = u64::from_be_bytes(name[..8].try_into().unwrap());
+            let last = if n == 9 { name[8] } else { 0 };
+            if x & HIGH == 0
+                && (x.wrapping_sub(ONES) & !x & HIGH) == 0
+                && (n == 8 || (last != 0 && last < 128))
+            {
+                #[cfg(target_arch = "x86_64")]
+                if std::arch::is_x86_feature_detected!("bmi2") {
+                    return (unsafe { pack_eight(x) } << 7) | u64::from(last);
+                }
+            }
+        }
+        if n <= 9 && name.iter().all(|c| *c > 0 && *c < 128) {
+            let key = name
+                .iter()
+                .fold(0u64, |acc, &byte| (acc << 7) | u64::from(byte));
+            return key << (7 * (9 - n));
+        }
+        self.intern_long(name)
+    }
+
+    #[cold]
+    fn intern_long(&self, name: Text<'a>) -> u64 {
+        let bucket = crate::input::signature(name) % 32;
+        let mut guard = self.dictionaries[bucket].lock().unwrap();
+        let (map, names) = &mut *guard;
+        *map.entry(name).or_insert_with(|| {
+            let key = EXTERNAL | ((names.len() as u64) << 5) | bucket as u64;
+            names.push(name);
+            key
+        })
+    }
+    pub fn decode(&self, key: u64) -> Vec<u8> {
+        if key & EXTERNAL != 0 {
+            return self.dictionaries[(key & 31) as usize].lock().unwrap().1
+                [((key ^ EXTERNAL) >> 5) as usize]
+                .to_vec();
+        }
+        let mut bytes = Vec::with_capacity(9);
+        for i in (0..9).rev() {
+            let b = ((key >> (i * 7)) & 127) as u8;
+            if b == 0 {
+                break;
+            }
+            bytes.push(b);
+        }
+        bytes
+    }
+    #[inline]
+    pub fn cmp(&self, a: u64, b: u64) -> Ordering {
+        if a == b || (a | b) & EXTERNAL == 0 {
+            a.cmp(&b)
+        } else {
+            self.decode(a).cmp(&self.decode(b))
+        }
+    }
+}
+
+#[inline]
+pub fn mixed(key: u64) -> usize {
+    let x = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb) as usize
+}
+#[inline]
+pub fn partition(key: u64) -> usize {
+    mixed(key) >> 57
+}

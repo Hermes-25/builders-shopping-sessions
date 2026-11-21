@@ -51,12 +51,29 @@ fn days(group: &mut Group, items: impl Iterator<Item = i32>) {
         .unwrap();
     col.close().unwrap();
 }
-pub fn users(path: &Path, rows: &[UserDay]) {
+pub fn users(path: &Path, rows: &[UserDay], names: &crate::Names, labels: &[Text]) {
     write_table(
         path,
         "message users { REQUIRED BINARY user_id (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; OPTIONAL BINARY top_category (UTF8); }",
         |g| {
-            strings(g, rows.iter().map(|r| r.user));
+            let mut col = g.next_column().unwrap().unwrap();
+            let mut last = u64::MAX;
+            let mut name = ByteArray::default();
+            let values: Vec<_> = rows
+                .iter()
+                .map(|r| {
+                    if last != r.user {
+                        last = r.user;
+                        name = ByteArray::from(names.decode(r.user));
+                    }
+                    name.clone()
+                })
+                .collect();
+            col.typed::<ByteArrayType>()
+                .write_batch(&values, None, None)
+                .unwrap();
+            col.close().unwrap();
+
             days(g, rows.iter().map(|r| r.day));
             numbers(g, rows.iter().map(|r| r.sessions));
             numbers(g, rows.iter().map(|r| r.events));
@@ -65,7 +82,7 @@ pub fn users(path: &Path, rows: &[UserDay]) {
             let defs: Vec<i16> = rows.iter().map(|r| i16::from(r.top.is_some())).collect();
             let values: Vec<_> = rows
                 .iter()
-                .filter_map(|r| r.top.map(ByteArray::from))
+                .filter_map(|r| r.top.map(|id| ByteArray::from(labels[id as usize])))
                 .collect();
             col.typed::<ByteArrayType>()
                 .write_batch(&values, Some(&defs), None)
@@ -74,17 +91,21 @@ pub fn users(path: &Path, rows: &[UserDay]) {
         },
     );
 }
-pub fn campaigns(path: &Path, totals: &Campaigns, channels: &Map<Text, Text>) {
+pub fn campaigns(path: &Path, totals: &Campaigns, channels: &Map<Text, Text>, campaigns: &[Text]) {
     let rows: Vec<_> = totals.iter().collect();
     write_table(
         path,
         "message campaigns { REQUIRED BINARY campaign_id (UTF8); REQUIRED BINARY channel (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions; REQUIRED INT64 revenue_cents; REQUIRED INT64 assisted_sessions; }",
         |g| {
-            strings(g, rows.iter().map(|((c, _), _)| *c));
+            strings(g, rows.iter().map(|((c, _), _)| campaigns[*c as usize]));
             strings(
                 g,
-                rows.iter()
-                    .map(|((c, _), _)| channels.get(*c).copied().unwrap_or(b"organic")),
+                rows.iter().map(|((c, _), _)| {
+                    channels
+                        .get(campaigns[*c as usize])
+                        .copied()
+                        .unwrap_or(b"organic")
+                }),
             );
             days(g, rows.iter().map(|((_, d), _)| *d));
             numbers(g, rows.iter().map(|(_, t)| t.sessions));
