@@ -1,4 +1,4 @@
-use crate::{Click, Event, Map, buckets, names, partition};
+use crate::{Click, Map, buckets, names, partition};
 #[derive(Clone, Copy)]
 struct Slot {
     key: u64,
@@ -59,7 +59,7 @@ pub trait Row: Copy {
     fn key(&self) -> u64;
     fn set(&mut self, k: u64);
 }
-impl Row for Event {
+impl<V: crate::events::Data> Row for crate::events::Event<V> {
     fn key(&self) -> u64 {
         self.user
     }

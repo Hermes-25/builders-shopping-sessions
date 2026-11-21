@@ -1,4 +1,4 @@
-use crate::{Campaigns, Map, Text, UserDay};
+use crate::{Campaigns, Map, Text};
 use parquet::{
     basic::Encoding,
     data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type},
@@ -15,6 +15,8 @@ fn write_table(path: &Path, schema: &str, fill: impl FnOnce(&mut Group)) {
     let schema = Arc::new(parse_message_type(schema).unwrap());
     let props = WriterProperties::builder()
         .set_dictionary_enabled(false)
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+        .set_offset_index_disabled(true)
         .set_encoding(Encoding::PLAIN)
         .build();
     let mut writer = SerializedFileWriter::new(
@@ -50,46 +52,6 @@ fn days(group: &mut Group, items: impl Iterator<Item = i32>) {
         .write_batch(&items.collect::<Vec<_>>(), None, None)
         .unwrap();
     col.close().unwrap();
-}
-pub fn users(path: &Path, rows: &[UserDay], names: &crate::Names, labels: &[Text]) {
-    write_table(
-        path,
-        "message users { REQUIRED BINARY user_id (UTF8); REQUIRED INT32 day (DATE); REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents; OPTIONAL BINARY top_category (UTF8); }",
-        |g| {
-            let mut col = g.next_column().unwrap().unwrap();
-            let mut last = u64::MAX;
-            let mut name = ByteArray::default();
-            let values: Vec<_> = rows
-                .iter()
-                .map(|r| {
-                    if last != r.user {
-                        last = r.user;
-                        name = ByteArray::from(names.decode(r.user));
-                    }
-                    name.clone()
-                })
-                .collect();
-            col.typed::<ByteArrayType>()
-                .write_batch(&values, None, None)
-                .unwrap();
-            col.close().unwrap();
-
-            days(g, rows.iter().map(|r| r.day));
-            numbers(g, rows.iter().map(|r| r.sessions));
-            numbers(g, rows.iter().map(|r| r.events));
-            numbers(g, rows.iter().map(|r| r.revenue));
-            let mut col = g.next_column().unwrap().unwrap();
-            let defs: Vec<i16> = rows.iter().map(|r| i16::from(r.top.is_some())).collect();
-            let values: Vec<_> = rows
-                .iter()
-                .filter_map(|r| r.top.map(|id| ByteArray::from(labels[id as usize])))
-                .collect();
-            col.typed::<ByteArrayType>()
-                .write_batch(&values, Some(&defs), None)
-                .unwrap();
-            col.close().unwrap();
-        },
-    );
 }
 pub fn campaigns(path: &Path, totals: &Campaigns, channels: &Map<Text, Text>, campaigns: &[Text]) {
     let rows: Vec<_> = totals.iter().collect();

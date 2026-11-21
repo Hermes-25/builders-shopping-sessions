@@ -1,16 +1,21 @@
 mod aliases;
+mod bulk_parquet;
 mod campaigns;
-use aliases::{Aliases, Router};
+mod dates;
+mod events;
 mod input;
-mod output;
-use campaigns::CampaignGrid;
 mod names;
+mod output;
 mod timelines;
+
+use aliases::{Aliases, Router};
+use campaigns::CampaignGrid;
 use input::{DAY, Text, WEEK, chunks, decimal, linked, load, read_pairs, rows, timestamp};
 use names::{Names, partition};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as Map;
 use std::{env, fs, path::PathBuf};
+use timelines::Visit;
 
 type Buckets<T> = Vec<Vec<T>>;
 fn buckets<T>() -> Buckets<T> {
@@ -30,19 +35,6 @@ fn transpose<T>(matrix: Vec<Buckets<T>>) -> Vec<Vec<Vec<T>>> {
     out
 }
 
-#[derive(Clone, Copy)]
-struct Event {
-    user: u64,
-    ts: i64,
-    price: u32,
-    category: u32,
-}
-#[derive(Clone, Copy)]
-struct Candidate {
-    id: u64,
-    ingest: i64,
-    event: Event,
-}
 #[derive(Clone, Copy)]
 struct Click {
     user: u64,
@@ -240,95 +232,37 @@ fn main() {
     let names = Names::default();
     let aliases = Aliases::new(linked(&l, &names));
     measure("catalogs and identities");
+    let dates = dates::Dates::new(lo, hi);
     let event_chunks = chunks(&es);
-    let event_names = Names::default();
-    let parts: Vec<_> = event_chunks
-        .into_par_iter()
-        .map(|chunk| {
-            let mut out = buckets();
-            let mut cached: (Text, u64) = (b"", u64::MAX);
-            rows::<7>(
-                chunk,
-                |[id, user, raw_ts, raw_ingest, kind, product, price]| {
-                    if id.is_empty() {
-                        return;
-                    }
-                    let ingest = input::ingest_time(raw_ingest);
-                    let ts = timestamp(raw_ts).unwrap_or(i64::MIN);
-                    let valid = ts >= lo
-                        && ts < hi
-                        && ingest - ts <= DAY
-                        && !user.is_empty()
-                        && !product.is_empty();
-                    let (price, category) = if valid && kind == b"purchase" {
-                        (
-                            decimal(price, 10_000_000).unwrap_or(0) as u32,
-                            *products.get(product).unwrap_or(&unknown),
-                        )
-                    } else {
-                        (0, unknown)
-                    };
-                    let valid = valid && (kind == b"view" || kind == b"cart" || price > 0);
-                    let id = event_names.encode(id);
-                    if valid && cached.0 != user {
-                        let k = names.encode(user);
-                        cached = (user, k);
-                    }
-                    let event = Event {
-                        user: if valid { cached.1 } else { u64::MAX },
-                        ts,
-                        price,
-                        category,
-                    };
-                    out[names::mixed(id) % 128].push(Candidate { id, ingest, event });
-                },
-            );
-            out
-        })
-        .collect();
-    measure("event decoding");
-    let by_user: Vec<_> = transpose(parts)
-        .into_par_iter()
-        .map(|parts| {
-            // A singleton fingerprint proves uniqueness. All possible collisions
-            // and actual duplicates go through the exact identifier map.
-            let bins = parts
-                .iter()
-                .map(Vec::len)
-                .sum::<usize>()
-                .max(1)
-                .next_power_of_two()
-                * 8;
-            let mut counts = vec![0u8; bins];
-            for c in parts.iter().flatten() {
-                let slot = &mut counts[(names::mixed(c.id) >> 7) & (bins - 1)];
-                *slot = (*slot + 1).min(2);
-            }
-            let mut grouped = Router::new(&aliases);
-            let mut winners: Map<u64, (i64, Event)> = Map::default();
-            for candidate in parts.into_iter().flatten() {
-                if counts[(names::mixed(candidate.id) >> 7) & (bins - 1)] == 1 {
-                    if candidate.event.user != u64::MAX {
-                        grouped.push(candidate.event);
-                    }
-                    continue;
-                }
-                let slot = winners
-                    .entry(candidate.id)
-                    .or_insert((candidate.ingest, candidate.event));
-                if candidate.ingest < slot.0 {
-                    *slot = (candidate.ingest, candidate.event);
-                }
-            }
-            for (_, event) in winners.into_values() {
-                if event.user != u64::MAX {
-                    grouped.push(event);
-                }
-            }
-            grouped.finish()
-        })
-        .collect();
-
+    let parcel: Vec<events::Parcel> = if hi - lo <= i64::from(u32::MAX) && labels.len() <= 256 {
+        events::route::<events::Short>(
+            event_chunks,
+            lo,
+            hi,
+            &products,
+            unknown,
+            &names,
+            &aliases,
+            &dates,
+        )
+        .into_iter()
+        .map(events::Parcel::Narrow)
+        .collect()
+    } else {
+        events::route::<Visit>(
+            event_chunks,
+            lo,
+            hi,
+            &products,
+            unknown,
+            &names,
+            &aliases,
+            &dates,
+        )
+        .into_iter()
+        .map(events::Parcel::Wide)
+        .collect()
+    };
     measure("event deduplication");
     let click_names = Names::default();
     let click_parts: Vec<_> = chunks(&cs)
@@ -342,7 +276,7 @@ fn main() {
                 if id.is_empty() || user.is_empty() {
                     return;
                 }
-                if let Some(ts) = timestamp(raw).filter(|t| *t >= lo - WEEK && *t < hi) {
+                if let Some(ts) = dates.parse(raw).filter(|t| *t >= lo - WEEK && *t < hi) {
                     let user = names.encode(user);
                     grouped.push(Click {
                         user,
@@ -369,10 +303,7 @@ fn main() {
             ))
         })
         .collect();
-    let parcels: Vec<_> = transpose(by_user)
-        .into_iter()
-        .zip(transpose(click_parts))
-        .collect();
+    let parcels: Vec<_> = parcel.into_iter().zip(transpose(click_parts)).collect();
     let job_count = threads.saturating_mul(3).clamp(1, parcels.len());
     let mut jobs: Vec<Vec<_>> = (0..job_count).map(|_| Vec::new()).collect();
     for (i, p) in parcels.into_iter().enumerate() {
@@ -385,7 +316,7 @@ fn main() {
         let mut active = Window::new(campaigns.len());
         let mut category_sums = vec![0; labels.len()];
         for (ev, cl) in parts {
-            let timelines = timelines::Timelines::build(ev, cl);
+            let timelines = ev.timelines(cl, lo);
             timelines.for_each(&click_names, |user, events, clicks| {
                 sessions(
                     user,
@@ -399,7 +330,7 @@ fn main() {
             });
         }
         if index == 0 || !rows.is_empty() {
-            output::users(
+            bulk_parquet::write(
                 &udir.join(format!("{index}.parquet")),
                 &rows,
                 &names,

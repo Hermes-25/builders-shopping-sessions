@@ -55,6 +55,20 @@ impl<'a> Names<'a> {
             key
         })
     }
+    pub fn append_plain(&self, key: u64, out: &mut Vec<u8>) {
+        if key & EXTERNAL != 0 {
+            let guard = self.dictionaries[(key & 31) as usize].lock().unwrap();
+            let bytes = guard.1[((key ^ EXTERNAL) >> 5) as usize];
+            out.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
+            out.extend_from_slice(bytes);
+        } else {
+            let len = 9 - (key.trailing_zeros() / 7).min(9);
+            out.extend_from_slice(&len.to_le_bytes());
+            for i in (9 - len..9).rev() {
+                out.push(((key >> (7 * i)) & 127) as u8);
+            }
+        }
+    }
     pub fn decode(&self, key: u64) -> Vec<u8> {
         if key & EXTERNAL != 0 {
             return self.dictionaries[(key & 31) as usize].lock().unwrap().1

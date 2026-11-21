@@ -1,4 +1,5 @@
-use crate::{Click, Event, Map, Names};
+use crate::events::{Data, Event};
+use crate::{Click, Map, Names};
 #[derive(Clone, Copy, Default)]
 pub struct Visit {
     pub ts: i64,
@@ -23,7 +24,11 @@ pub struct Timelines {
     ads: Vec<Ad>,
 }
 impl Timelines {
-    pub fn build(mut events: Vec<Vec<Event>>, mut clicks: Vec<Vec<Click>>) -> Self {
+    pub fn build<V: Data>(
+        mut events: Vec<Vec<Event<V>>>,
+        mut clicks: Vec<Vec<Click>>,
+        lo: i64,
+    ) -> Self {
         let mut index = Map::<u64, usize>::default();
         let mut people = Vec::<Span>::new();
         let mut event_count = 0;
@@ -67,11 +72,7 @@ impl Timelines {
         let mut ads = vec![Ad::default(); click_count];
         for e in events.into_iter().flatten() {
             let span = &mut people[e.user as usize];
-            visits[span.events] = Visit {
-                ts: e.ts,
-                price: e.price,
-                category: e.category,
-            };
+            visits[span.events] = e.data.visit(lo);
             span.events += 1;
         }
         for c in clicks.into_iter().flatten().filter(|c| c.user != u64::MAX) {

@@ -49,7 +49,10 @@ pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
 
 pub fn rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnMut([&'a [u8]; N])) {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("popcnt")
+    {
         return unsafe { record_rows(chunk, process) };
     }
 
@@ -342,7 +345,7 @@ pub fn ingest_time(s: &[u8]) -> i64 {
     days * DAY + ((two(s, 11) * 60 + two(s, 14)) * 60 + two(s, 17)) * 1000
 }
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,bmi2,popcnt")]
 unsafe fn record_rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnMut([&'a [u8]; N])) {
     use std::arch::x86_64::*;
     // Caller guarantees a readable 32-byte block before loading.
@@ -385,34 +388,34 @@ unsafe fn record_rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnM
             continue;
         }
         let ends = commas | end_bit;
-        let edge = ((commas << 1) | 1) | (ends >> 1);
-        if quotes & !edge != 0 {
+        let starts = (commas << 1) | 1;
+        let stops = ends >> 1;
+        if quotes & !(starts | stops) != 0 || quotes & starts & stops != 0 {
+            continue;
+        }
+        // Pack quote presence at each field boundary and compare matching edges.
+        let project = |mask: u128| {
+            _pext_u64(quotes as u64, mask as u64)
+                | (_pext_u64((quotes >> 64) as u64, (mask >> 64) as u64)
+                    << (mask as u64).count_ones())
+        };
+        let mut opening = project(starts);
+        let closing = project(stops) << ((ends & 1) as u32);
+        if opening != closing {
             continue;
         }
         let mut fields = [&[][..]; N];
         let mut separators = ends;
         let mut start = 0;
-        let mut valid = true;
         for f in &mut fields {
             let end = separators.trailing_zeros() as usize;
             separators &= separators - 1;
-            let mut s = &record[start..end];
+            let trim = (opening & 1) as usize;
+            opening >>= 1;
+            *f = &record[start + trim..end - trim];
             start = end + 1;
-            if s.first() == Some(&b'"') {
-                if s.len() < 2 || s.last() != Some(&b'"') {
-                    valid = false;
-                    break;
-                }
-                s = &s[1..s.len() - 1];
-            } else if s.last() == Some(&b'"') {
-                valid = false;
-                break;
-            }
-            *f = s;
         }
-        if valid {
-            process(fields);
-        }
+        process(fields);
     }
     unsafe { vector_rows(&chunk[base..], process) };
 }
