@@ -10,7 +10,7 @@ mod timelines;
 
 use aliases::{Aliases, Router};
 use campaigns::CampaignGrid;
-use input::{DAY, Text, WEEK, decimal, linked, load, read_pairs, rows, timestamp};
+use input::{DAY, Text, WEEK, decimal, link_edges, load, read_pairs, rows, timestamp};
 use names::Names;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap as Map;
@@ -72,6 +72,7 @@ struct Window {
     counts: Vec<u32>,
     positions: Vec<usize>,
     present: Vec<u32>,
+    opened: Vec<usize>,
 }
 impl Window {
     fn new(n: usize) -> Self {
@@ -79,6 +80,7 @@ impl Window {
             counts: vec![0; n],
             positions: vec![0; n],
             present: Vec::new(),
+            opened: vec![0; n],
         }
     }
     fn add(&mut self, id: u32) {
@@ -105,6 +107,15 @@ impl Window {
             self.counts[id as usize] = 0;
         }
     }
+    fn record_day(&mut self, through: usize, day: i32, campaigns: &mut CampaignGrid) {
+        for &id in &self.present {
+            let start = &mut self.opened[id as usize];
+            if *start != through {
+                campaigns.cell(id, day).assists += (through - *start) as i64;
+                *start = through;
+            }
+        }
+    }
 }
 
 struct Daily<'a> {
@@ -120,6 +131,20 @@ fn sessions<V: timelines::OrderedVisit, A: timelines::AdData>(
     lo: i64,
     output: &mut Daily<'_>,
 ) {
+    if clicks.len() >= 64 && events.len() >= 16 {
+        session_scan::<true, V, A>(user, events, clicks, lo, output)
+    } else {
+        session_scan::<false, V, A>(user, events, clicks, lo, output)
+    }
+}
+
+fn session_scan<const INTERVALS: bool, V: timelines::OrderedVisit, A: timelines::AdData>(
+    user: u64,
+    events: &[V],
+    clicks: &[A],
+    lo: i64,
+    output: &mut Daily<'_>,
+) {
     let Daily {
         users,
         campaigns,
@@ -129,9 +154,17 @@ fn sessions<V: timelines::OrderedVisit, A: timelines::AdData>(
     let (mut left, mut right) = (0, 0);
     active.clear();
     let mut i = 0;
+    let mut session_index = 0;
+    let mut previous_day = 0;
     while i < events.len() {
         let ts = events[i].visit(lo).ts;
         let day = ts.div_euclid(DAY) as i32;
+        if INTERVALS && session_index > 0 && previous_day != day {
+            // Charge only sessions from the previous reporting day before opening
+            // the first session of the next day. Gaps can span several days.
+            active.record_day(session_index, previous_day, campaigns);
+        }
+        previous_day = day;
         if users.last().is_none_or(|r| r.user != user || r.day != day) {
             categories.fill(0);
             users.push(UserDay {
@@ -145,12 +178,22 @@ fn sessions<V: timelines::OrderedVisit, A: timelines::AdData>(
         }
         let row = users.last_mut().unwrap();
         while right < clicks.len() && clicks[right].time(lo - WEEK) <= ts {
-            active.add(clicks[right].campaign());
+            let id = clicks[right].campaign();
+            if INTERVALS && active.counts[id as usize] == 0 {
+                active.opened[id as usize] = session_index;
+            }
+            active.add(id);
             right += 1;
         }
         while left < right && clicks[left].time(lo - WEEK) < ts - WEEK {
             let campaign = clicks[left].campaign();
             active.remove(campaign);
+            if INTERVALS && active.counts[campaign as usize] == 0 {
+                let amount = session_index - active.opened[campaign as usize];
+                if amount > 0 {
+                    campaigns.cell(campaign, day).assists += amount as i64;
+                }
+            }
             left += 1;
         }
         let credit = if left < right {
@@ -158,8 +201,10 @@ fn sessions<V: timelines::OrderedVisit, A: timelines::AdData>(
         } else {
             0
         };
-        for &campaign in &active.present {
-            campaigns.cell(campaign, day).assists += 1;
+        if !INTERVALS {
+            for &campaign in &active.present {
+                campaigns.cell(campaign, day).assists += 1;
+            }
         }
         let mut last = ts;
         let mut revenue = 0;
@@ -188,6 +233,10 @@ fn sessions<V: timelines::OrderedVisit, A: timelines::AdData>(
         c.sessions += 1;
         c.purchasing += i64::from(revenue > 0);
         c.revenue += revenue;
+        session_index += 1;
+    }
+    if INTERVALS && session_index > 0 {
+        active.record_day(session_index, previous_day, campaigns);
     }
 }
 
@@ -241,7 +290,8 @@ fn main() {
     let cs = input::windows(&data.join("clicks"));
     let names = Names::default();
     let aliases = Aliases::new(
-        linked(&l, &names),
+        link_edges(&l, &names),
+        &names,
         es.iter().chain(&cs).map(|file| file.bytes).sum(),
     );
     measure("catalogs and identities");

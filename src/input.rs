@@ -43,16 +43,64 @@ pub struct FileWindow {
     file: Arc<File>,
     offset: usize,
     pub bytes: usize,
+    size: usize,
 }
+
+pub struct WindowRows {
+    map: Mmap,
+    range: std::ops::Range<usize>,
+}
+
+impl std::ops::Deref for WindowRows {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.map[self.range.clone()]
+    }
+}
+
 impl FileWindow {
-    pub fn read(&self) -> Mmap {
-        // The read-only contest inputs remain immutable for the entire invocation.
-        unsafe {
-            MmapOptions::new()
-                .offset(self.offset as u64)
-                .len(self.bytes)
-                .map(self.file.as_ref())
-                .unwrap()
+    pub fn read(&self) -> WindowRows {
+        // Each nominal window owns rows whose first byte falls inside it. A byte
+        // before the window distinguishes a row boundary from a partial record.
+        let prefix = usize::from(self.offset != 0);
+        let offset = self.offset - prefix;
+        let nominal_end = prefix + self.bytes;
+        let remaining = self.size - offset;
+        let mut length = nominal_end.saturating_add(4096).min(remaining);
+        loop {
+            // Input files are immutable during processing.
+            let map = unsafe {
+                MmapOptions::new()
+                    .offset(offset as u64)
+                    .len(length)
+                    .map(&*self.file)
+                    .unwrap()
+            };
+            let start = if prefix == 1 && map[0] == b'\n' {
+                1
+            } else {
+                // The file's first row is its header. All other incomplete
+                // first records belong to whichever window contains their start.
+                memchr(b'\n', &map[..nominal_end]).map_or(nominal_end, |index| index + 1)
+            };
+            if start >= nominal_end {
+                return WindowRows { map, range: 0..0 };
+            }
+            if let Some(index) = memchr(b'\n', &map[nominal_end - 1..]) {
+                return WindowRows {
+                    map,
+                    range: start..nominal_end + index,
+                };
+            }
+            if length == remaining {
+                return WindowRows {
+                    map,
+                    range: start..length,
+                };
+            }
+            // There is a row longer than the normal overlap. Only the window
+            // that owns its first byte expands until its terminator or EOF.
+            length = length.saturating_mul(2).min(remaining);
         }
     }
 }
@@ -60,26 +108,55 @@ pub fn windows(path: &Path) -> Vec<FileWindow> {
     let mut windows = Vec::new();
     for path in csv_files(path) {
         let file = Arc::new(File::open(path).unwrap());
-        if file.metadata().unwrap().len() == 0 {
-            continue;
-        }
-        // Touch only the header and the newline near each nominal boundary.
-        let sample = unsafe { Mmap::map(file.as_ref()).unwrap() };
-        let Some(mut start) = memchr(b'\n', &sample).map(|i| i + 1) else {
-            continue;
-        };
-        while start < sample.len() {
-            let target = (start + 2 * 1024 * 1024).min(sample.len());
-            let end = memchr(b'\n', &sample[target..]).map_or(sample.len(), |n| target + n + 1);
+        let size = usize::try_from(file.metadata().unwrap().len()).unwrap();
+        const BYTES: usize = 2 * 1024 * 1024;
+        for offset in (0..size).step_by(BYTES) {
             windows.push(FileWindow {
                 file: file.clone(),
-                offset: start,
-                bytes: end - start,
+                offset,
+                bytes: (size - offset).min(BYTES),
+                size,
             });
-            start = end;
         }
     }
     windows
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn nominal_windows_own_whole_records_once() {
+        let path =
+            std::env::temp_dir().join(format!("shopping-window-test-{}", std::process::id()));
+        let long_record = vec![b'x'; 12_000];
+        for (header, rows) in [
+            (b"h\n".as_slice(), b"a\n\nxyz\nlast".as_slice()),
+            (b"header\n", b"a\n\nxyz\nlast\n"),
+            (b"only header", b""),
+            (b"\n", b"\n"),
+            (b"header\n", long_record.as_slice()),
+        ] {
+            let contents = [header, rows].concat();
+            std::fs::write(&path, &contents).unwrap();
+            let file = Arc::new(File::open(&path).unwrap());
+            for width in [1, 2, 3, 4, 5, 7, 127, 3500, 4096] {
+                let mut actual = Vec::new();
+                for offset in (0..contents.len()).step_by(width) {
+                    let window = FileWindow {
+                        file: file.clone(),
+                        offset,
+                        bytes: width.min(contents.len() - offset),
+                        size: contents.len(),
+                    };
+                    actual.extend_from_slice(&window.read());
+                }
+                assert_eq!(actual.as_slice(), rows);
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
@@ -248,9 +325,9 @@ pub fn read_pairs(files: &[Mmap]) -> Map<Text<'_>, Text<'_>> {
     m
 }
 
-pub fn linked(files: &[Mmap], codec: &crate::Names) -> Map<u64, u64> {
+pub fn link_edges(files: &[Mmap], codec: &crate::Names) -> Vec<Vec<(u64, u64)>> {
     use rayon::prelude::*;
-    let edges: Vec<_> = chunks(files)
+    chunks(files)
         .into_par_iter()
         .map(|chunk| {
             let mut edges = Vec::new();
@@ -261,48 +338,7 @@ pub fn linked(files: &[Mmap], codec: &crate::Names) -> Map<u64, u64> {
             });
             edges
         })
-        .collect();
-    let n = edges.iter().map(Vec::len).sum::<usize>();
-    let mut id = Map::<u64, usize>::default();
-    id.reserve(n);
-    let mut parent = Vec::<usize>::with_capacity(n);
-    let mut minima = Vec::<u64>::with_capacity(n);
-    fn find(parent: &mut [usize], mut i: usize) -> usize {
-        while i != parent[i] {
-            parent[i] = parent[parent[i]];
-            i = parent[i];
-        }
-        i
-    }
-    for (a, b) in edges.into_iter().flatten() {
-        let mut intern = |k| {
-            *id.entry(k).or_insert_with(|| {
-                let i = parent.len();
-                parent.push(i);
-                minima.push(k);
-                i
-            })
-        };
-        let (a, b) = (intern(a), intern(b));
-        let (a, b) = (find(&mut parent, a), find(&mut parent, b));
-        if a != b {
-            let (lo, hi) = if codec.cmp(minima[a], minima[b]).is_lt() {
-                (a, b)
-            } else {
-                (b, a)
-            };
-            parent[hi] = lo;
-        }
-    }
-    let mut resolved = Map::default();
-    resolved.reserve(id.len() / 2);
-    for (key, i) in id {
-        let name = minima[find(&mut parent, i)];
-        if key != name {
-            resolved.insert(key, name);
-        }
-    }
-    resolved
+        .collect()
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -1,6 +1,7 @@
 use crate::{Click, Map, buckets, names};
 
 use crate::timelines::PlacedClick;
+use rayon::prelude::*;
 use std::sync::{
     Mutex,
     atomic::{AtomicU64, Ordering::Relaxed},
@@ -29,13 +30,15 @@ pub struct Aliases {
 }
 
 impl Aliases {
-    pub fn new(links: Map<u64, u64>, input_bytes: usize) -> Self {
-        let estimated = (input_bytes / 750).max(links.len().saturating_mul(3));
+    pub fn new(mut edges: Vec<Vec<(u64, u64)>>, names: &crate::Names, input_bytes: usize) -> Self {
+        let link_rows: usize = edges.iter().map(Vec::len).sum();
+        let estimated = (input_bytes / 750).max(link_rows.saturating_mul(2));
         let capacity = estimated
             .div_ceil(BINS)
             .clamp(32, 1 << 19)
             .next_power_of_two();
         let bins = (0..BINS)
+            .into_par_iter()
             .map(|_| Bin {
                 slots: (0..capacity)
                     .map(|_| Slot {
@@ -51,19 +54,77 @@ impl Aliases {
             bins,
             mask: capacity - 1,
         };
-        // The link resolver supplies final component minima, including minima
-        // which have no events. Install those redirects before parallel readers start.
-        for (key, canonical) in links {
-            let target = out.intern(canonical, out.bucket(canonical));
-            let source = out.intern(key, out.bucket(key));
-            let bin = &mut out.bins[(source & 127) as usize];
-            let slot = (source >> 7) as usize;
-            if slot < capacity {
-                bin.slots[slot].representative = target;
-            } else {
-                bin.representatives.insert(slot as u32, target);
-            }
+        if link_rows == 0 {
+            return out;
         }
+        edges.par_iter_mut().for_each(|part| {
+            for (a, b) in part {
+                *a = out.intern(*a, out.bucket(*a));
+                *b = out.intern(*b, out.bucket(*b));
+            }
+        });
+        let parents: Vec<Vec<AtomicU64>> = (0..BINS)
+            .into_par_iter()
+            .map(|part| {
+                (0..out.width(part))
+                    .map(|_| AtomicU64::new(EMPTY))
+                    .collect()
+            })
+            .collect();
+        let parent = |key: u64| &parents[(key & 127) as usize][(key >> 7) as usize];
+        let root = |mut key: u64| {
+            loop {
+                let next = parent(key).load(Relaxed);
+                if next == EMPTY {
+                    return key;
+                }
+                let after = parent(next).load(Relaxed);
+                if after == EMPTY {
+                    return next;
+                }
+                let _ = parent(key).compare_exchange(next, after, Relaxed, Relaxed);
+                key = after;
+            }
+        };
+        let bytes_key = |v: u64| out.key((v & 127) as usize, (v >> 7) as usize);
+        edges.into_par_iter().for_each(|part| {
+            for (mut a, mut b) in part {
+                loop {
+                    a = root(a);
+                    b = root(b);
+                    if a == b {
+                        break;
+                    }
+                    let (high, low) = if names.cmp(bytes_key(a), bytes_key(b)).is_lt() {
+                        (b, a)
+                    } else {
+                        (a, b)
+                    };
+                    // Every edge points strictly toward a smaller byte string.
+                    // A concurrent union can only shorten the path to the minimum.
+                    if parent(high)
+                        .compare_exchange(EMPTY, low, Relaxed, Relaxed)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        out.bins.par_iter_mut().enumerate().for_each(|(part, bin)| {
+            for (slot, edge) in parents[part].iter().enumerate() {
+                let p = edge.load(Relaxed);
+                if p == EMPTY {
+                    continue;
+                }
+                let destination = root(p);
+                if slot < capacity {
+                    bin.slots[slot].representative = destination;
+                } else {
+                    bin.representatives.insert(slot as u32, destination);
+                }
+            }
+        });
         out
     }
     #[inline]
