@@ -48,7 +48,7 @@ impl Names {
     }
 
     #[cold]
-    fn intern_long(&self, name: Text<'_>) -> u64 {
+    pub(crate) fn intern_long(&self, name: Text<'_>) -> u64 {
         let bucket = crate::input::signature(name) % 32;
         let mut guard = self.dictionaries[bucket].lock().unwrap();
         let (map, names) = &mut *guard;

@@ -86,6 +86,64 @@ const PERSON_MASK: u64 = (1 << 24) - 1;
 const WIDE_BIT: u64 = 1 << 63;
 // A four-digit UTC year fits in 39 bits of seconds from 0000-01-01.
 const EPOCH_SHIFT: i64 = 62_167_219_200;
+
+struct EventIds {
+    shared_prefix: Option<u8>,
+    other: Names,
+}
+
+impl EventIds {
+    fn new(chunks: &[crate::input::FileWindow]) -> Self {
+        let mut counts = [0u32; 256];
+        let mut count = 0;
+        for window in chunks.iter().take(3) {
+            let bytes = window.read();
+            for row in bytes.split(|&b| b == b'\n').take(64) {
+                let field = row.split(|&b| b == b',').next().unwrap_or_default();
+                let inner = field.strip_prefix(b"\"").unwrap_or(field);
+                if let Some(&first) = inner.first() {
+                    counts[first as usize] += 1;
+                    count += 1;
+                }
+            }
+        }
+        let shared_prefix = counts.iter()
+            .position(|&n| count != 0 && n * 8 >= count * 7)
+            .map(|p| p as u8);
+        Self { shared_prefix, other: Names::default() }
+    }
+
+    #[inline]
+    fn encode(&self, name: &[u8]) -> u64 {
+        let Some(prefix) = self.shared_prefix else {
+            return self.other.encode(name);
+        };
+        if name.len() == 9 && name[0] == prefix && (1..128).contains(&name[8]) {
+            return u64::from_le_bytes(name[1..9].try_into().unwrap());
+        }
+        if (2..9).contains(&name.len()) && name[0] == prefix && name.last() != Some(&0) {
+            let mut suffix = [0; 8];
+            suffix[..name.len() - 1].copy_from_slice(&name[1..]);
+            return u64::from_le_bytes(suffix);
+        }
+        // The high bit distinguishes dictionary references from inlined suffixes.
+        // A suffix ending in NUL must use the dictionary because inlined suffixes are padded with NUL.
+        self.other.intern_long(name)
+    }
+}
+
+#[test]
+fn prefix_ids_are_exact_at_encoding_boundaries() {
+    use std::collections::HashSet;
+    let dictionary = EventIds { shared_prefix: Some(b'e'), other: Names::default() };
+    let sample: &[&[u8]] = &[
+        b"e", b"e\0", b"ea", b"ea\0", b"e\0a", b"f\0a", b"e1234567", b"e12345678",
+        b"e1234567\0", b"e1234567\x80", b"e123456789", b"e\xff", b"e\xff\x01", b"f12345678",
+    ];
+    let keys: HashSet<_> = sample.iter().map(|s| dictionary.encode(s)).collect();
+    assert_eq!(keys.len(), sample.len());
+    assert!(sample.iter().all(|s| keys.contains(&dictionary.encode(s))));
+}
 #[derive(Default)]
 struct Stamps(std::sync::Mutex<Vec<(i64, u64)>>);
 #[cfg(test)]
@@ -237,7 +295,7 @@ pub fn route<'a, V: Data>(
         .into_par_iter()
         .map(|_| std::sync::Mutex::new(Table::new(estimate)))
         .collect();
-    let ids = Names::default();
+    let ids = EventIds::new(&chunks);
     let stamps = Stamps::default();
     chunks.into_par_iter().enumerate().for_each_init(
         || (buckets(), Vec::with_capacity(48)),
