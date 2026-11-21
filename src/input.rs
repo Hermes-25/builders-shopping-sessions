@@ -162,10 +162,10 @@ pub fn timestamp(s: &[u8]) -> Option<i64> {
     Some(days * DAY + ((hour * 60 + minute - offset) * 60 + sec) * 1000)
 }
 
-pub fn shard(key: &[u8]) -> usize {
+pub fn signature(key: &[u8]) -> usize {
     let mut hasher = FxHasher::default();
     hasher.write(key);
-    hasher.finish() as usize % 128
+    hasher.finish() as usize
 }
 
 pub fn read_pairs(files: &[Mmap]) -> Map<Text<'_>, Text<'_>> {
@@ -216,4 +216,8 @@ pub fn linked(files: &[Mmap]) -> Map<Text<'_>, Text<'_>> {
         ids.insert(name, root(&mut parent, i));
     }
     ids.into_iter().map(|(name, i)| (name, names[i])).collect()
+}
+
+pub fn shard(key: &[u8]) -> usize {
+    signature(key) % 128
 }
