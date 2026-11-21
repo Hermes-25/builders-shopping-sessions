@@ -50,7 +50,7 @@ pub fn chunks(files: &[Mmap]) -> Vec<&[u8]> {
 pub fn rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnMut([&'a [u8]; N])) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
-        return unsafe { vector_rows(chunk, process) };
+        return unsafe { record_rows(chunk, process) };
     }
 
     for line in memchr_iter(b'\n', chunk)
@@ -340,4 +340,79 @@ pub fn ingest_time(s: &[u8]) -> i64 {
     let march = if m > 2 { m - 3 } else { m + 9 };
     let days = era * 146097 + 365 * r + r / 4 - r / 100 + (153 * march + 2) / 5 + d - 1 - 719468;
     days * DAY + ((two(s, 11) * 60 + two(s, 14)) * 60 + two(s, 17)) * 1000
+}
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn record_rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnMut([&'a [u8]; N])) {
+    use std::arch::x86_64::*;
+    // Caller guarantees a readable 32-byte block before loading.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn masks(p: *const u8) -> (u32, u32, u32) {
+        let v = unsafe { _mm256_loadu_si256(p.cast()) };
+        let mask = |ch| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(ch))) as u32;
+        (mask(b',' as i8), mask(b'\n' as i8), mask(b'"' as i8))
+    }
+    let mut base = 0;
+    while chunk.len() - base >= 128 {
+        let p = unsafe { chunk.as_ptr().add(base) };
+        let (a, b, c) = unsafe { masks(p) };
+        let mut commas = u128::from(a);
+        let mut lf = u128::from(b);
+        let mut quotes = u128::from(c);
+        let mut shift = 32;
+        while lf == 0 && shift < 128 {
+            let (a, b, c) = unsafe { masks(p.add(shift)) };
+            commas |= u128::from(a) << shift;
+            lf |= u128::from(b) << shift;
+            quotes |= u128::from(c) << shift;
+            shift += 32;
+        }
+        if lf == 0 {
+            let beyond = base + 128;
+            let end = memchr(b'\n', &chunk[beyond..]).map_or(chunk.len(), |i| beyond + i + 1);
+            unsafe { vector_rows(&chunk[base..end], &mut process) };
+            base = end;
+            continue;
+        }
+        let length = lf.trailing_zeros() as usize;
+        let end_bit = 1u128 << length;
+        commas &= end_bit - 1;
+        quotes &= end_bit - 1;
+        let record = &chunk[base..base + length];
+        base += length + 1;
+        if commas.count_ones() as usize != N - 1 {
+            continue;
+        }
+        let ends = commas | end_bit;
+        let edge = ((commas << 1) | 1) | (ends >> 1);
+        if quotes & !edge != 0 {
+            continue;
+        }
+        let mut fields = [&[][..]; N];
+        let mut separators = ends;
+        let mut start = 0;
+        let mut valid = true;
+        for f in &mut fields {
+            let end = separators.trailing_zeros() as usize;
+            separators &= separators - 1;
+            let mut s = &record[start..end];
+            start = end + 1;
+            if s.first() == Some(&b'"') {
+                if s.len() < 2 || s.last() != Some(&b'"') {
+                    valid = false;
+                    break;
+                }
+                s = &s[1..s.len() - 1];
+            } else if s.last() == Some(&b'"') {
+                valid = false;
+                break;
+            }
+            *f = s;
+        }
+        if valid {
+            process(fields);
+        }
+    }
+    unsafe { vector_rows(&chunk[base..], process) };
 }

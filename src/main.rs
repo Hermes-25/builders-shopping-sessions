@@ -1,4 +1,6 @@
+mod aliases;
 mod campaigns;
+use aliases::{Aliases, Router};
 mod input;
 mod output;
 use campaigns::CampaignGrid;
@@ -236,12 +238,7 @@ fn main() {
     let es = load(&data.join("events"));
     let cs = load(&data.join("clicks"));
     let names = Names::default();
-    let alias = linked(&l, &names);
-    let resolve = |name| {
-        let k = names.encode(name);
-        alias.get(&k).copied().unwrap_or(k)
-    };
-
+    let aliases = Aliases::new(linked(&l, &names));
     measure("catalogs and identities");
     let event_chunks = chunks(&es);
     let event_names = Names::default();
@@ -274,7 +271,7 @@ fn main() {
                     let valid = valid && (kind == b"view" || kind == b"cart" || price > 0);
                     let id = event_names.encode(id);
                     if valid && cached.0 != user {
-                        let k = resolve(user);
+                        let k = names.encode(user);
                         cached = (user, k);
                     }
                     let event = Event {
@@ -307,12 +304,12 @@ fn main() {
                 let slot = &mut counts[(names::mixed(c.id) >> 7) & (bins - 1)];
                 *slot = (*slot + 1).min(2);
             }
-            let mut grouped = buckets();
+            let mut grouped = Router::new(&aliases);
             let mut winners: Map<u64, (i64, Event)> = Map::default();
             for candidate in parts.into_iter().flatten() {
                 if counts[(names::mixed(candidate.id) >> 7) & (bins - 1)] == 1 {
                     if candidate.event.user != u64::MAX {
-                        grouped[partition(candidate.event.user)].push(candidate.event);
+                        grouped.push(candidate.event);
                     }
                     continue;
                 }
@@ -325,10 +322,10 @@ fn main() {
             }
             for (_, event) in winners.into_values() {
                 if event.user != u64::MAX {
-                    grouped[partition(event.user)].push(event);
+                    grouped.push(event);
                 }
             }
-            grouped
+            grouped.finish()
         })
         .collect();
 
@@ -337,7 +334,7 @@ fn main() {
     let click_parts: Vec<_> = chunks(&cs)
         .into_par_iter()
         .map(|chunk| {
-            let mut grouped = buckets();
+            let mut grouped = Router::new(&aliases);
             rows::<4>(chunk, |[id, user, campaign, raw]| {
                 let Some(&campaign) = campaign_ids.get(campaign) else {
                     return;
@@ -346,8 +343,8 @@ fn main() {
                     return;
                 }
                 if let Some(ts) = timestamp(raw).filter(|t| *t >= lo - WEEK && *t < hi) {
-                    let user = resolve(user);
-                    grouped[partition(user)].push(Click {
+                    let user = names.encode(user);
+                    grouped.push(Click {
                         user,
                         ts,
                         id: click_names.encode(id),
@@ -355,7 +352,7 @@ fn main() {
                     });
                 }
             });
-            grouped
+            grouped.finish()
         })
         .collect();
     measure("click decoding");
