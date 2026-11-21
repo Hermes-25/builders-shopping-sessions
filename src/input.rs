@@ -11,6 +11,138 @@ use std::{
 };
 
 pub type Text<'a> = &'a [u8];
+
+pub struct Catalog<'a> {
+    prefix: Text<'a>,
+    first: u32,
+    dense: Vec<u32>,
+    other: Map<Text<'a>, u32>,
+}
+
+// Canonical decimal suffixes have one byte spelling per integer. Other
+// spellings retain their full byte keys in the regular catalog.
+#[inline]
+fn suffix_number(s: &[u8]) -> Option<u32> {
+    if s.is_empty() || s.len() > 9 || (s[0] == b'0' && s.len() > 1) {
+        return None;
+    }
+    let mut value = 0;
+    for &byte in s {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value * 10 + u32::from(digit);
+    }
+    Some(value)
+}
+
+impl<'a> Catalog<'a> {
+    pub fn new(mut values: Map<Text<'a>, u32>) -> Self {
+        let mut ranges = Map::<Text<'a>, (u32, u32, usize)>::default();
+        for &key in values.keys() {
+            let start = key
+                .iter()
+                .rposition(|c| !c.is_ascii_digit())
+                .map_or(0, |pos| pos + 1);
+            if let Some(value) = suffix_number(&key[start..]) {
+                let range = ranges.entry(&key[..start]).or_insert((value, value, 0));
+                range.0 = range.0.min(value);
+                range.1 = range.1.max(value);
+                range.2 += 1;
+            }
+        }
+        let mut dense = Vec::new();
+        let mut prefix: Text<'a> = &[];
+        let mut first = 0;
+        if let Some((pattern, (low, high, _))) = ranges
+            .into_iter()
+            .filter(|(_, (low, high, count))| {
+                *count >= 8 && (high - low) as usize <= count.saturating_mul(4)
+            })
+            .max_by_key(|(_, range)| range.2)
+        {
+            prefix = pattern;
+            first = low;
+            dense.resize((high - low) as usize + 1, u32::MAX);
+            values.retain(|&key, value| {
+                if *value != u32::MAX
+                    && let Some(index) = key.strip_prefix(prefix).and_then(suffix_number)
+                    && let Some(slot) = dense.get_mut(index.wrapping_sub(first) as usize)
+                {
+                    *slot = *value;
+                    return false;
+                }
+                true
+            });
+        }
+        Self {
+            prefix,
+            first,
+            dense,
+            other: values,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, key: &[u8]) -> Option<u32> {
+        if !self.dense.is_empty()
+            && let Some(index) = key.strip_prefix(self.prefix).and_then(suffix_number)
+            && let Some(&id) = self.dense.get(index.wrapping_sub(self.first) as usize)
+            && id != u32::MAX
+        {
+            return Some(id);
+        }
+        self.other.get(key).copied()
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn dense_and_sparse_names_preserve_the_complete_map() {
+        let mut names: Vec<Vec<u8>> = (100..130)
+            .filter(|&n| n != 116)
+            .map(|n| format!("qK{n}").into_bytes())
+            .collect();
+        names.extend(
+            [
+                "qK0117",
+                "qK23A",
+                "QK118",
+                "Ω119",
+                "1234567890",
+                "qK",
+                "x113",
+            ]
+            .map(|s| s.as_bytes().to_vec()),
+        );
+        let mut reference: Map<_, _> = names
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.as_slice(), index as u32))
+            .collect();
+        reference.insert(b"qK110", u32::MAX);
+        let catalog = Catalog::new(reference.clone());
+        for (key, &id) in &reference {
+            assert_eq!(catalog.get(key), Some(id));
+        }
+        for absent in [
+            "qK99",
+            "qK116",
+            "qK130",
+            "qK000",
+            "qK00",
+            "QK112",
+            "",
+            "qK4294967296",
+        ] {
+            assert_eq!(catalog.get(absent.as_bytes()), None);
+        }
+    }
+}
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 
@@ -518,8 +650,8 @@ unsafe fn record_rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnM
             // Each half holds at least three separators and the full row has six.
             for rank in 0..3 {
                 offsets[rank] = _pdep_u64(1u64 << rank, low).trailing_zeros() as usize;
-                offsets[3 + rank] = shift
-                    + _pdep_u64(first_tail_rank << rank, tail).trailing_zeros() as usize;
+                offsets[3 + rank] =
+                    shift + _pdep_u64(first_tail_rank << rank, tail).trailing_zeros() as usize;
             }
         } else {
             offsets = std::array::from_fn(|rank| {
@@ -590,7 +722,11 @@ mod record_tests {
         for width in [2, 4, 7] {
             let mut input = Vec::new();
             for i in 0..1400 {
-                let field_count = if i % 7 == 0 { 1 + next() as usize % 9 } else { width };
+                let field_count = if i % 7 == 0 {
+                    1 + next() as usize % 9
+                } else {
+                    width
+                };
                 for j in 0..field_count {
                     if j != 0 {
                         input.push(b',');
@@ -600,7 +736,10 @@ mod record_tests {
                         input.push(b'"');
                     }
                     let size = if j == i % field_count && i % 3 == 0 {
-                        [0, 1, 2, 30, 31, 32, 33, 62, 63, 64, 65, 94, 95, 96, 97, 126, 127, 128, 129, 150][i % 20]
+                        [
+                            0, 1, 2, 30, 31, 32, 33, 62, 63, 64, 65, 94, 95, 96, 97, 126, 127, 128,
+                            129, 150,
+                        ][i % 20]
                     } else {
                         next() as usize % 8
                     };

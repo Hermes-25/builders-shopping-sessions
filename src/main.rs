@@ -276,6 +276,7 @@ fn main() {
         .into_iter()
         .map(|(k, v)| (k, category_id(v)))
         .collect();
+    let products = input::Catalog::new(products);
     let unknown = category_id(b"unknown");
     let c = load(&data.join("campaigns.csv"));
     let channels = read_pairs(&c);
@@ -287,6 +288,7 @@ fn main() {
         .skip(1)
         .map(|(i, &c)| (c, i as u32))
         .collect();
+    let campaign_ids = input::Catalog::new(campaign_ids);
     let es = input::windows(&data.join("events"));
     let cs = input::windows(&data.join("clicks"));
     let names = Names::default();
@@ -335,7 +337,7 @@ fn main() {
             let mapped = chunk.read();
             let mut grouped = Router::new(&aliases);
             rows::<4>(&mapped, |[id, user, campaign, raw]| {
-                let Some(&campaign) = campaign_ids.get(campaign) else {
+                let Some(campaign) = campaign_ids.get(campaign) else {
                     return;
                 };
                 if id.is_empty() || user.is_empty() {

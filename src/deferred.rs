@@ -1,5 +1,5 @@
 use crate::{
-    DAY, Map, Names, Text,
+    DAY, Names,
     aliases::Aliases,
     buckets,
     dates::Dates,
@@ -201,7 +201,7 @@ pub fn route<'a, V: Data>(
     chunks: Vec<FileWindow>,
     lo: i64,
     hi: i64,
-    products: &Map<Text<'a>, u32>,
+    products: &crate::input::Catalog<'a>,
     unknown: u32,
     people: &Names,
     aliases: &Aliases,
@@ -244,7 +244,7 @@ pub fn route<'a, V: Data>(
                     let (price, category) = if valid && kind == b"purchase" {
                         (
                             decimal(price, 10_000_000).unwrap_or(0) as u32,
-                            *products.get(product).unwrap_or(&unknown),
+                            products.get(product).unwrap_or(unknown),
                         )
                     } else {
                         (0, 0)
