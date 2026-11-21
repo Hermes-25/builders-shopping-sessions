@@ -446,17 +446,22 @@ unsafe fn record_rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnM
     let mut base = 0;
     while chunk.len() - base >= 128 {
         let p = unsafe { chunk.as_ptr().add(base) };
-        let (a, b, c) = unsafe { masks(p) };
-        let mut commas = u128::from(a);
-        let mut lf = u128::from(b);
-        let mut quotes = u128::from(c);
-        let mut shift = 32;
-        while lf == 0 && shift < 128 {
-            let (a, b, c) = unsafe { masks(p.add(shift)) };
-            commas |= u128::from(a) << shift;
-            lf |= u128::from(b) << shift;
-            quotes |= u128::from(c) << shift;
-            shift += 32;
+        let (a0, b0, c0) = unsafe { masks(p) };
+        let (a1, b1, c1) = unsafe { masks(p.add(32)) };
+        let mut commas = u128::from(a0) | (u128::from(a1) << 32);
+        let mut lf = u128::from(b0) | (u128::from(b1) << 32);
+        let mut quotes = u128::from(c0) | (u128::from(c1) << 32);
+        if lf == 0 {
+            let (a2, b2, c2) = unsafe { masks(p.add(64)) };
+            commas |= u128::from(a2) << 64;
+            lf |= u128::from(b2) << 64;
+            quotes |= u128::from(c2) << 64;
+            if b2 == 0 {
+                let (a3, b3, c3) = unsafe { masks(p.add(96)) };
+                commas |= u128::from(a3) << 96;
+                lf |= u128::from(b3) << 96;
+                quotes |= u128::from(c3) << 96;
+            }
         }
         if lf == 0 {
             let beyond = base + 128;
@@ -486,23 +491,142 @@ unsafe fn record_rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnM
                 | (_pext_u64((quotes >> 64) as u64, (mask >> 64) as u64)
                     << (mask as u64).count_ones())
         };
-        let mut opening = project(starts);
-        let closing = project(stops) << ((ends & 1) as u32);
-        if opening != closing {
-            continue;
+        let opening = if quotes == 0 {
+            0
+        } else {
+            let opening = project(starts);
+            let closing = project(stops) << ((ends & 1) as u32);
+            if opening != closing {
+                continue;
+            }
+            opening
+        };
+        // A deposited one-bit rank selects a separator independently of the
+        // preceding fields. Offsets can therefore be issued in parallel.
+        let low = commas as u64;
+        let high = (commas >> 64) as u64;
+        let in_low = low.count_ones() as usize;
+        let mut offsets = [length; N];
+        if length <= 64 {
+            for (rank, slot) in offsets[..N - 1].iter_mut().enumerate() {
+                *slot = _pdep_u64(1u64 << rank, low).trailing_zeros() as usize;
+            }
+        } else if N == 7 && in_low >= 3 && (commas >> (length - 64)).count_ones() >= 3 {
+            let shift = length - 64;
+            let tail = (commas >> shift) as u64;
+            let first_tail_rank = 1u64 << (tail.count_ones() - 3);
+            // Each half holds at least three separators and the full row has six.
+            for rank in 0..3 {
+                offsets[rank] = _pdep_u64(1u64 << rank, low).trailing_zeros() as usize;
+                offsets[3 + rank] = shift
+                    + _pdep_u64(first_tail_rank << rank, tail).trailing_zeros() as usize;
+            }
+        } else {
+            offsets = std::array::from_fn(|rank| {
+                if rank + 1 == N {
+                    return length;
+                }
+                if rank < in_low {
+                    _pdep_u64(1u64 << rank, low).trailing_zeros() as usize
+                } else {
+                    64 + _pdep_u64(1u64 << (rank - in_low), high).trailing_zeros() as usize
+                }
+            });
         }
         let mut fields = [&[][..]; N];
-        let mut separators = ends;
         let mut start = 0;
-        for f in &mut fields {
-            let end = separators.trailing_zeros() as usize;
-            separators &= separators - 1;
-            let trim = (opening & 1) as usize;
-            opening >>= 1;
-            *f = &record[start + trim..end - trim];
+        for (rank, end) in offsets.into_iter().enumerate() {
+            let trim = ((opening >> rank) & 1) as usize;
+            // Separator ranks increase within this row. Quoted fields have two
+            // distinct edges, so removing both still leaves a valid range.
+            fields[rank] = unsafe { record.get_unchecked(start + trim..end - trim) };
             start = end + 1;
         }
         process(fields);
     }
     unsafe { vector_rows(&chunk[base..], process) };
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::rows;
+
+    fn check<const N: usize>(input: &[u8]) {
+        let mut expected = Vec::new();
+        for line in input.split(|&byte| byte == b'\n') {
+            let mut fields = Vec::new();
+            for cell in line.split(|&byte| byte == b',') {
+                let inside = if cell.len() >= 2 && cell[0] == b'"' && cell[cell.len() - 1] == b'"' {
+                    &cell[1..cell.len() - 1]
+                } else {
+                    cell
+                };
+                if inside.contains(&b'"') {
+                    fields.clear();
+                    break;
+                }
+                fields.push(inside.to_vec());
+            }
+            if fields.len() == N {
+                expected.push(fields);
+            }
+        }
+        let mut observed = Vec::new();
+        rows::<N>(input, |row| {
+            observed.push(row.iter().map(|field| field.to_vec()).collect::<Vec<_>>());
+        });
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn all_parser_boundaries_match_scalar_fields() {
+        let mut state = 0x32d63db409d806d3u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for width in [2, 4, 7] {
+            let mut input = Vec::new();
+            for i in 0..1400 {
+                let field_count = if i % 7 == 0 { 1 + next() as usize % 9 } else { width };
+                for j in 0..field_count {
+                    if j != 0 {
+                        input.push(b',');
+                    }
+                    let mode = next() % 16;
+                    if mode <= 5 {
+                        input.push(b'"');
+                    }
+                    let size = if j == i % field_count && i % 3 == 0 {
+                        [0, 1, 2, 30, 31, 32, 33, 62, 63, 64, 65, 94, 95, 96, 97, 126, 127, 128, 129, 150][i % 20]
+                    } else {
+                        next() as usize % 8
+                    };
+                    for k in 0..size {
+                        let byte = if mode == 6 && k == size / 2 {
+                            b'"'
+                        } else if mode == 7 && k == 1 {
+                            b'\r'
+                        } else {
+                            b'A' + (next() % 26) as u8
+                        };
+                        input.push(byte);
+                    }
+                    if mode <= 4 || mode == 8 {
+                        input.push(b'"');
+                    }
+                }
+                if i != 1399 {
+                    input.push(b'\n');
+                }
+            }
+            match width {
+                2 => check::<2>(&input),
+                4 => check::<4>(&input),
+                _ => check::<7>(&input),
+            }
+        }
+    }
 }
