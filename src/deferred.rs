@@ -48,7 +48,7 @@ fn scatter_rows(input: Vec<Row>, ends: &[usize]) -> Vec<Row> {
         next[partition] += length;
     };
     for row in input {
-        let partition = names::mixed(row.id) & (partitions - 1);
+        let partition = row.id as usize & (partitions - 1);
         let index = usize::from(held[partition]);
         staged[partition * BATCH + index] = row;
         if index + 1 == BATCH {
@@ -144,8 +144,8 @@ mod tests {
                 let mut ends = vec![0; partitions + 1];
                 let mut input = Vec::new();
                 for sequence in 0..count {
-                    let id = ((sequence * 17) % 37 + 1) as u64;
-                    ends[(names::mixed(id) & (partitions - 1)) + 1] += 1;
+                    let id = names::mixed(((sequence * 17) % 37 + 1) as u64) as u64;
+                    ends[(id as usize & (partitions - 1)) + 1] += 1;
                     input.push(Row {
                         id,
                         user: sequence as u64,
@@ -159,7 +159,7 @@ mod tests {
                 let mut sequences = Vec::new();
                 for part in 0..partitions {
                     for record in &output[ends[part]..ends[part + 1]] {
-                        assert_eq!(names::mixed(record.id) & (partitions - 1), part);
+                        assert_eq!(record.id as usize & (partitions - 1), part);
                         sequences.push(record.user);
                     }
                 }
@@ -253,8 +253,10 @@ pub fn route<'a, V: Data>(
                     if valid && cached.0 != user {
                         cached = (user, people.encode(user));
                     }
-                    let id = event_ids.encode(id);
-                    ends[(names::mixed(id) & (groups - 1)) + 1] += 1;
+                    // This reversible permutation serves as both an exact identity
+                    // and a hash in every later pass.
+                    let id = names::mixed(event_ids.encode(id)) as u64;
+                    ends[(id as usize & (groups - 1)) + 1] += 1;
                     let payload = encode(
                         source_number,
                         &mut wide,
@@ -288,6 +290,8 @@ pub fn route<'a, V: Data>(
         .into_par_iter()
         .map(|job| {
             let mut out = buckets();
+            let mut slots = Vec::<u64>::new();
+            let mut winners = Vec::<Row>::new();
             for group in (job..groups).step_by(jobs) {
                 // Every duplicate shares an event-ID partition. Its table is owned by this job.
                 let count = sources.iter().map(|s| s.group(group).len()).sum::<usize>();
@@ -295,29 +299,41 @@ pub fn route<'a, V: Data>(
                     continue;
                 }
                 let mask = (count + count / 3 + 1).next_power_of_two() - 1;
-                let mut winners = vec![Row::default(); mask + 1];
+                // The group generation makes slots reusable without clearing the table.
+                // Only the dense winners own payloads. A fingerprint filters collisions.
+                let generation = ((group + 1) as u64) << 48;
+                if slots.len() < mask + 1 {
+                    slots.resize(mask + 1, 0);
+                }
+                winners.clear();
+                winners.reserve(count);
                 for source in &sources {
                     for &row in source.group(group) {
-                        let mut pos = (names::mixed(row.id) >> group_shift) & mask;
+                        let mut pos = (row.id as usize >> group_shift) & mask;
+                        let signature = generation | ((row.id >> 48) << 32);
                         loop {
-                            let old = &mut winners[pos];
-                            // Empty event names are discarded. Every retained name has a nonzero encoding.
-                            if old.id == 0 {
-                                *old = row;
+                            let slot = slots[pos];
+                            if slot >> 48 != generation >> 48 {
+                                let index = u32::try_from(winners.len()).unwrap();
+                                slots[pos] = signature | u64::from(index);
+                                winners.push(row);
                                 break;
                             }
-                            if old.id == row.id {
-                                if earlier(row.payload, old.payload, &sources, lo) {
-                                    *old = row;
+                            if slot >> 32 == signature >> 32 {
+                                let old = &mut winners[slot as u32 as usize];
+                                if old.id == row.id {
+                                    if earlier(row.payload, old.payload, &sources, lo) {
+                                        *old = row;
+                                    }
+                                    break;
                                 }
-                                break;
                             }
                             pos = (pos + 1) & mask;
                         }
                     }
                 }
-                for row in winners {
-                    if row.id != 0 && row.user != u64::MAX {
+                for &row in &winners {
+                    if row.user != u64::MAX {
                         let shard = names::mixed(row.user) >> 57;
                         out[shard].push(RawVisit {
                             user: row.user,
