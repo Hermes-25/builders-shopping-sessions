@@ -12,4 +12,4 @@ A native Rust implementation of the Databricks Shopping Sessions track. Build wi
 
 Dependencies are pinned in Cargo.lock and include Apache Parquet, Rayon, memchr, memmap2, rustc-hash, and serde_json. All contest-specific processing code was written for this entry. The official generator, fixtures and expected tables are used for local verification.
 
-An optional input generator in `tools/profile_input.rs` produces a synthetic clickstream for local profiling. Compile it with `rustc -O tools/profile_input.rs -o profile-input` and run `./profile-input <empty-directory>`.
+The Docker build generates a synthetic clickstream with `tools/profile_input.rs` and runs an instrumented solver on it. The Rust compiler uses the resulting branch counts to build the production executable. The runtime image contains the executable and Debian base.
