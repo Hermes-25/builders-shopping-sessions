@@ -2,6 +2,7 @@ mod aliases;
 mod bulk_parquet;
 mod campaigns;
 mod dates;
+mod deferred;
 mod events;
 mod input;
 mod names;
@@ -298,7 +299,7 @@ fn main() {
     let dates = dates::Dates::new(lo, hi);
     let event_chunks = es;
     let parcel: Vec<events::Parcel> = if hi - lo <= i64::from(u32::MAX) && labels.len() <= 256 {
-        events::route::<events::Short>(
+        deferred::route::<events::Short>(
             event_chunks,
             lo,
             hi,
@@ -312,7 +313,7 @@ fn main() {
         .map(events::Parcel::Narrow)
         .collect()
     } else {
-        events::route::<Visit>(
+        deferred::route::<Visit>(
             event_chunks,
             lo,
             hi,
