@@ -290,49 +290,29 @@ pub fn route<'a, V: Data>(
         .into_par_iter()
         .map(|job| {
             let mut out = buckets();
-            let mut slots = Vec::<u64>::new();
-            let mut winners = Vec::<Row>::new();
+            let mut counts = Vec::<(u64, u64)>::new();
+            let mut contested = Map::<u64, Row>::default();
             for group in (job..groups).step_by(jobs) {
-                // Every duplicate shares an event-ID partition. Its table is owned by this job.
                 let count = sources.iter().map(|s| s.group(group).len()).sum::<usize>();
                 if count == 0 {
                     continue;
                 }
-                let mask = (count + count / 3 + 1).next_power_of_two() - 1;
-                // The group generation makes slots reusable without clearing the table.
-                // Only the dense winners own payloads. A fingerprint filters collisions.
-                let generation = ((group + 1) as u64) << 48;
-                if slots.len() < mask + 1 {
-                    slots.resize(mask + 1, 0);
-                }
-                winners.clear();
-                winners.reserve(count);
+                // Count visits to hash slots with two saturating bitmaps. A
+                // singly occupied slot proves its sole record has a unique ID.
+                let positions = count.next_power_of_two().saturating_mul(16).max(64);
+                let mask = positions - 1;
+                counts.clear();
+                counts.resize(positions / 64, (0, 0));
                 for source in &sources {
-                    for &row in source.group(group) {
-                        let mut pos = (row.id as usize >> group_shift) & mask;
-                        let signature = generation | ((row.id >> 48) << 32);
-                        loop {
-                            let slot = slots[pos];
-                            if slot >> 48 != generation >> 48 {
-                                let index = u32::try_from(winners.len()).unwrap();
-                                slots[pos] = signature | u64::from(index);
-                                winners.push(row);
-                                break;
-                            }
-                            if slot >> 32 == signature >> 32 {
-                                let old = &mut winners[slot as u32 as usize];
-                                if old.id == row.id {
-                                    if earlier(row.payload, old.payload, &sources, lo) {
-                                        *old = row;
-                                    }
-                                    break;
-                                }
-                            }
-                            pos = (pos + 1) & mask;
-                        }
+                    for row in source.group(group) {
+                        let position = (row.id as usize >> group_shift) & mask;
+                        let bit = 1u64 << (position & 63);
+                        let word = &mut counts[position >> 6];
+                        word.1 |= word.0 & bit;
+                        word.0 |= bit;
                     }
                 }
-                for &row in &winners {
+                let mut emit = |row: Row| {
                     if row.user != u64::MAX {
                         let shard = names::mixed(row.user) >> 57;
                         out[shard].push(RawVisit {
@@ -340,6 +320,24 @@ pub fn route<'a, V: Data>(
                             visit: visit(row.payload, &sources, lo),
                         });
                     }
+                };
+                for source in &sources {
+                    for &row in source.group(group) {
+                        let position = (row.id as usize >> group_shift) & mask;
+                        if counts[position >> 6].1 & (1u64 << (position & 63)) == 0 {
+                            emit(row);
+                        } else {
+                            // All copies of an equal event key share this slot.
+                            // Resolve uncertain rows using their complete key.
+                            let winner = contested.entry(row.id).or_insert(row);
+                            if earlier(row.payload, winner.payload, &sources, lo) {
+                                *winner = row;
+                            }
+                        }
+                    }
+                }
+                for (_, winner) in contested.drain() {
+                    emit(winner);
                 }
             }
             out
