@@ -9,6 +9,7 @@ use crate::{
     names, rows, transpose,
 };
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 // A source owns one allocation. The range offsets partition its rows by event ID.
 #[derive(Clone, Copy, Default)]
@@ -132,10 +133,483 @@ fn visit<V: Data>(value: u64, sources: &[Source<V>], lo: i64) -> V {
     }
 }
 
+const ID_MASK: u64 = (1 << 40) - 1;
+const MULTIPLIER: u64 = 0x9e37_79b9_7f4b;
+const INVERSE_FIRST: u64 = 0x3d_ee21_9263;
+const INVERSE_LAST: u64 = 0xa0_9058_81e9;
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn eight_base36(digits: &[u8]) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let input = unsafe { _mm_loadl_epi64(digits.as_ptr().cast()) };
+    let decimal = _mm_and_si128(
+        _mm_cmpgt_epi8(input, _mm_set1_epi8(47)),
+        _mm_cmpgt_epi8(_mm_set1_epi8(58), input),
+    );
+    let letter = _mm_and_si128(
+        _mm_cmpgt_epi8(input, _mm_set1_epi8(96)),
+        _mm_cmpgt_epi8(_mm_set1_epi8(123), input),
+    );
+    if _mm_movemask_epi8(_mm_or_si128(decimal, letter)) & 255 != 255 {
+        return None;
+    }
+    let values = _mm_sub_epi8(
+        _mm_sub_epi8(input, _mm_set1_epi8(48)),
+        _mm_and_si128(letter, _mm_set1_epi8(39)),
+    );
+    let pairs = _mm_maddubs_epi16(values, _mm_set1_epi16(0x0124));
+    let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0510));
+    let both = _mm_cvtsi128_si64(quads) as u64;
+    Some((both as u32 as u64) * 1_679_616 + (both >> 32))
+}
+
+// Inverting two fixed permutations of the public base-36 encoding leaves an
+// arbitrary XOR translation. Every possible translation remains a bijection.
+// We choose one from the observed IDs solely to make the resulting table dense.
+#[inline]
+fn untranslated(text: &[u8]) -> Option<u64> {
+    let (&prefix, digits) = text.split_first()?;
+    if prefix != b'e'
+        || digits.is_empty()
+        || digits.len() > 8
+        || (digits.len() != 1 && digits[0] == b'0')
+    {
+        return None;
+    }
+    let scalar = || {
+        let mut number = 0u64;
+        for &byte in digits {
+            let digit = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'z' => byte - b'a' + 10,
+                _ => return None,
+            };
+            number = number * 36 + u64::from(digit);
+        }
+        Some(number)
+    };
+    #[cfg(target_arch = "x86_64")]
+    let number = if digits.len() == 8 && std::arch::is_x86_feature_detected!("ssse3") {
+        unsafe { eight_base36(digits) }?
+    } else {
+        scalar()?
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let number = scalar()?;
+    if number > ID_MASK {
+        return None;
+    }
+    let y = number.wrapping_mul(INVERSE_LAST) & ID_MASK;
+    Some(y ^ (y >> 17) ^ (y >> 34))
+}
+
+#[derive(Clone, Copy)]
+struct Ordinals {
+    translation: u64,
+    capacity: usize,
+}
+
+impl Ordinals {
+    #[inline]
+    fn slot(self, key: u64) -> Option<usize> {
+        let index = ((key ^ self.translation).wrapping_mul(INVERSE_FIRST) & ID_MASK) as usize;
+        (index < self.capacity).then_some(index)
+    }
+
+    fn learn(windows: &[FileWindow], bytes: usize) -> Option<Self> {
+        // The capacity is a performance budget derived from input size. Distinct
+        // strings outside it take the ordinary exact sparse winner map.
+        let capacity = (bytes / 64).clamp(256, 100_000_000);
+        let mut anchors = Vec::new();
+        let mut sample = Vec::new();
+        let read_sample = |window: &FileWindow| -> Vec<u64> {
+            let contents = window.read();
+            contents
+                .split(|&b| b == b'\n')
+                .take(12)
+                .filter_map(|line| {
+                    let text = line.split(|&b| b == b',').next()?;
+                    let text = text
+                        .strip_prefix(b"\"")
+                        .and_then(|s| s.strip_suffix(b"\""))
+                        .unwrap_or(text);
+                    untranslated(text)
+                })
+                .collect()
+        };
+        for window in windows.iter().filter(|w| w.starts_file()).take(192) {
+            let ids = read_sample(window);
+            anchors.extend(ids.iter().take(2).copied());
+            sample.extend(ids.into_iter().take(2));
+        }
+        for window in windows
+            .iter()
+            .step_by(windows.len().div_ceil(20).max(1))
+            .take(20)
+        {
+            sample.extend(read_sample(window).into_iter().take(8));
+        }
+        if sample.len() < 12 {
+            return None;
+        }
+        for offset in 0u64..32 {
+            for &anchor in &anchors {
+                let layout = Self {
+                    translation: anchor ^ (offset.wrapping_mul(MULTIPLIER) & ID_MASK),
+                    capacity,
+                };
+                if sample.iter().take(8).all(|&k| layout.slot(k).is_some())
+                    && sample.iter().filter(|&&k| layout.slot(k).is_some()).count() * 20
+                        >= sample.len() * 19
+                {
+                    return Some(layout);
+                }
+            }
+        }
+        sample.sort_unstable();
+        sample.dedup();
+        if sample.len() < 10 {
+            return None;
+        }
+        let anchors = [sample[sample.len() / 3], sample[2 * sample.len() / 3]];
+        let probes = [sample[0], sample[sample.len() / 2], *sample.last().unwrap()];
+        for anchor in anchors {
+            // With disordered input the anchor could occupy any slot. Each
+            // possible position determines a single translation. Three
+            // independent key probes reject unlikely layouts before a full check.
+            if let Some(found) = (0..capacity).into_par_iter().find_map_any(|offset| {
+                let layout = Self {
+                    translation: anchor ^ ((offset as u64).wrapping_mul(MULTIPLIER) & ID_MASK),
+                    capacity,
+                };
+                if probes.iter().all(|&key| layout.slot(key).is_some())
+                    && sample
+                        .iter()
+                        .filter(|&&key| layout.slot(key).is_some())
+                        .count()
+                        * 20
+                        >= sample.len() * 19
+                {
+                    Some(layout)
+                } else {
+                    None
+                }
+            }) {
+                return Some(found);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DirectRow<V> {
+    slot: u32,
+    person: u32,
+    ingestion: u32,
+    data: V,
+}
+#[derive(Clone, Copy)]
+struct SparseRow<V> {
+    id: u64,
+    ingestion: i64,
+    person: u32,
+    data: V,
+}
+
+struct PendingPerson {
+    key: u64,
+    bucket: usize,
+    index: usize,
+    sparse: bool,
+}
+
+fn finish_people<V>(
+    aliases: &Aliases,
+    pending: &mut Vec<PendingPerson>,
+    cache: &mut [(u64, u32)],
+    dense: &mut [DirectRow<V>],
+    sparse: &mut [SparseRow<V>],
+    unsupported: &AtomicBool,
+) {
+    for row in pending.drain(..) {
+        let resolved = aliases.resolve(row.key, row.bucket);
+        let Ok(person) = u32::try_from(resolved) else {
+            unsupported.store(true, Relaxed);
+            continue;
+        };
+        if person == u32::MAX {
+            unsupported.store(true, Relaxed);
+            continue;
+        }
+        cache[row.bucket & (cache.len() - 1)] = (row.key, person);
+        if row.sparse {
+            sparse[row.index].person = person;
+        } else {
+            dense[row.index].person = person;
+        }
+    }
+}
+
+fn direct<'a, V: Data>(
+    chunks: &[FileWindow],
+    layout: Ordinals,
+    lo: i64,
+    hi: i64,
+    products: &Map<Text<'a>, u32>,
+    unknown: u32,
+    names: &Names,
+    aliases: &Aliases,
+    dates: &Dates,
+) -> Option<Vec<Vec<Vec<Placed<V>>>>> {
+    let sources = rayon::current_num_threads().min(chunks.len()).max(1);
+    let start = std::time::Instant::now();
+    let width = chunks.len().div_ceil(sources);
+    let unsupported = AtomicBool::new(false);
+    let words = layout.capacity.div_ceil(64);
+    let sparse_names = Names::default();
+    let parts: Vec<_> = chunks
+        .par_chunks(width)
+        .map(|windows| {
+            let mut dense = Vec::with_capacity(windows.iter().map(|w| w.bytes).sum::<usize>() / 96);
+            let mut sparse = Vec::new();
+            let mut seen = vec![0u64; words];
+            let mut repeated = vec![0u64; words];
+            let mut pending = Vec::with_capacity(48);
+            let mut cache = vec![(0, u32::MAX); 4096];
+            for window in windows {
+                let bytes = window.read();
+                rows::<7>(&bytes, |[id, user, raw, ingest, kind, product, cents]| {
+                    if id.is_empty() {
+                        return;
+                    }
+                    let ingestion = dates.ingest(ingest);
+                    let ts = dates.parse(raw).unwrap_or(i64::MIN);
+                    let valid = ts >= lo
+                        && ts < hi
+                        && ingestion - ts <= DAY
+                        && !user.is_empty()
+                        && !product.is_empty();
+                    let (price, category) = if valid && kind == b"purchase" {
+                        (
+                            decimal(cents, 10_000_000).unwrap_or(0) as u32,
+                            *products.get(product).unwrap_or(&unknown),
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    let valid = valid && (kind == b"view" || kind == b"cart" || price > 0);
+                    let mut person = u32::MAX;
+                    let mut deferred = None;
+                    if valid {
+                        let key = names.encode(user);
+                        let bucket = aliases.prefetch(key);
+                        let found = cache[bucket & (cache.len() - 1)];
+                        if found.0 == key && found.1 != u32::MAX {
+                            person = found.1;
+                        } else {
+                            deferred = Some((key, bucket));
+                        }
+                    }
+                    let data = V::pack(if valid { ts } else { lo }, price, category, lo);
+                    let destination;
+                    if let Some(slot) = untranslated(id).and_then(|key| layout.slot(key)) {
+                        let seconds =
+                            ingestion.div_euclid(1000) - lo.div_euclid(1000) + (1i64 << 31);
+                        if !(0..=i64::from(u32::MAX)).contains(&seconds) {
+                            unsupported.store(true, Relaxed);
+                            return;
+                        }
+                        let bit = 1u64 << (slot & 63);
+                        let word = slot >> 6;
+                        let previous = seen[word];
+                        if previous & bit != 0 {
+                            repeated[word] |= bit;
+                        }
+                        seen[word] = previous | bit;
+                        destination = (dense.len(), false);
+                        dense.push(DirectRow {
+                            slot: slot as u32,
+                            person,
+                            ingestion: seconds as u32,
+                            data,
+                        });
+                    } else {
+                        destination = (sparse.len(), true);
+                        sparse.push(SparseRow {
+                            id: sparse_names.encode(id),
+                            ingestion,
+                            person,
+                            data,
+                        });
+                    }
+                    if let Some((key, bucket)) = deferred {
+                        pending.push(PendingPerson {
+                            key,
+                            bucket,
+                            index: destination.0,
+                            sparse: destination.1,
+                        });
+                        if pending.len() == 48 {
+                            finish_people(
+                                aliases,
+                                &mut pending,
+                                &mut cache,
+                                &mut dense,
+                                &mut sparse,
+                                &unsupported,
+                            );
+                        }
+                    }
+                });
+            }
+            finish_people(
+                aliases,
+                &mut pending,
+                &mut cache,
+                &mut dense,
+                &mut sparse,
+                &unsupported,
+            );
+            ((dense, sparse), (seen, repeated))
+        })
+        .collect();
+    if unsupported.load(Relaxed) {
+        return None;
+    }
+    if std::env::var_os("TIMINGS").is_some() {
+        eprintln!("event projection and source masks {:?}", start.elapsed());
+    }
+    let (records, maps): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+    // A slot repeats if it repeats in a single source or belongs to two
+    // sources. Only this small union of exact IDs needs a winner record.
+    let repeated: Vec<u64> = (0..words)
+        .into_par_iter()
+        .map(|word| {
+            let mut union = 0;
+            let mut conflict = 0;
+            for (seen, local) in &maps {
+                conflict |= local[word] | (union & seen[word]);
+                union |= seen[word];
+            }
+            conflict
+        })
+        .collect();
+    drop(maps);
+    let sparse_count: usize = records.iter().map(|(_, s)| s.len()).sum();
+    if std::env::var_os("TIMINGS").is_some() {
+        eprintln!(
+            "direct event winners, slots {}, sparse rows {}",
+            layout.capacity, sparse_count
+        );
+    }
+    let (dense, sparse): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+    let (mut output, contests): (Vec<_>, Vec<_>) = dense
+        .into_par_iter()
+        .map(|records| {
+            let mut out = buckets();
+            let mut contests = buckets();
+            for row in records {
+                let slot = row.slot as usize;
+                if repeated[slot >> 6] & (1u64 << (slot & 63)) != 0 {
+                    contests[slot & 127].push(row);
+                } else if row.person != u32::MAX {
+                    out[(row.person & 127) as usize].push(Placed {
+                        user: row.person >> 7,
+                        data: row.data,
+                    });
+                }
+            }
+            (out, contests)
+        })
+        .unzip();
+    let contested: Vec<_> = transpose(contests)
+        .into_par_iter()
+        .map(|blocks| {
+            let mut exact = Map::<u32, DirectRow<V>>::default();
+            for row in blocks.into_iter().flatten() {
+                let old = exact.entry(row.slot).or_insert(row);
+                if row.ingestion < old.ingestion {
+                    *old = row;
+                }
+            }
+            let mut out = buckets();
+            for row in exact.into_values().filter(|r| r.person != u32::MAX) {
+                out[(row.person & 127) as usize].push(Placed {
+                    user: row.person >> 7,
+                    data: row.data,
+                });
+            }
+            out
+        })
+        .collect();
+    output.extend(contested);
+    let mut exact = Map::<u64, SparseRow<V>>::default();
+    for row in sparse.into_iter().flatten() {
+        let old = exact.entry(row.id).or_insert(row);
+        if row.ingestion < old.ingestion {
+            *old = row;
+        }
+    }
+    let mut out = buckets();
+    for row in exact.into_values().filter(|row| row.person != u32::MAX) {
+        out[(row.person & 127) as usize].push(Placed {
+            user: row.person >> 7,
+            data: row.data,
+        });
+    }
+    output.push(out);
+    Some(transpose(output))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::timelines::Visit;
+
+    #[test]
+    fn direct_spelling_is_canonical_and_bijective() {
+        fn spelling(value: u64) -> Vec<u8> {
+            let mut number = value;
+            let mut out = Vec::new();
+            loop {
+                out.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(number % 36) as usize]);
+                number /= 36;
+                if number == 0 {
+                    break;
+                }
+            }
+            out.push(b'e');
+            out.reverse();
+            out
+        }
+        for translation in [0, 23, 0x98_76ab_cdef] {
+            let layout = Ordinals {
+                translation,
+                capacity: 100_000,
+            };
+            for i in 0..100_000u64 {
+                let k = (i.wrapping_mul(MULTIPLIER) ^ translation) & ID_MASK;
+                let value = (k ^ (k >> 17)).wrapping_mul(0xd6e8_feb8_6659) & ID_MASK;
+                assert_eq!(
+                    untranslated(&spelling(value)).and_then(|x| layout.slot(x)),
+                    Some(i as usize)
+                );
+            }
+        }
+        for id in [
+            b"e00".as_slice(),
+            b"eaA",
+            b"E15",
+            b"e",
+            b"ezzzzzzzz",
+            b"e1111111\xff",
+            b"e1111111/",
+        ] {
+            assert!(untranslated(id).is_none());
+        }
+    }
 
     #[test]
     fn scatter_preserves_each_row_with_empty_and_partial_batches() {
@@ -208,6 +682,17 @@ pub fn route<'a, V: Data>(
     dates: &Dates,
 ) -> Vec<Vec<Vec<Placed<V>>>> {
     let bytes = chunks.iter().map(|w| w.bytes).sum::<usize>();
+    let started = std::time::Instant::now();
+    if let Some(layout) = Ordinals::learn(&chunks, bytes) {
+        if std::env::var_os("TIMINGS").is_some() {
+            eprintln!("event index layout selection {:?}", started.elapsed());
+        }
+        if let Some(result) = direct::<V>(
+            &chunks, layout, lo, hi, products, unknown, people, aliases, dates,
+        ) {
+            return result;
+        }
+    }
     let groups = (bytes / (90 * 8192)).clamp(1, 4096).next_power_of_two();
     let workers = rayon::current_num_threads();
     let chunk_width = chunks.len().div_ceil(workers * 4).max(1);

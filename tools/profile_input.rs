@@ -24,7 +24,13 @@ impl Random {
 }
 
 fn identifier(prefix: u8, index: u64) -> String {
-    let mut value = index.wrapping_mul(1_103_515_245).wrapping_add(12_345) & ((1u64 << 40) - 1);
+    let mask = (1u64 << 40) - 1;
+    let mut value = if prefix == b'e' {
+        let translated = (index.wrapping_mul(0x9e37_79b9_7f4b) ^ 0x53b2_8421) & mask;
+        (translated ^ (translated >> 17)).wrapping_mul(0xd6e8_feb8_6659) & mask
+    } else {
+        index.wrapping_mul(1_103_515_245).wrapping_add(12_345) & mask
+    };
     let mut text = vec![prefix];
     let mut digits = Vec::new();
     loop {

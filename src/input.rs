@@ -59,6 +59,10 @@ impl std::ops::Deref for WindowRows {
 }
 
 impl FileWindow {
+    pub fn starts_file(&self) -> bool {
+        self.offset == 0
+    }
+
     pub fn read(&self) -> WindowRows {
         // Each nominal window owns rows whose first byte falls inside it. A byte
         // before the window distinguishes a row boundary from a partial record.
@@ -518,8 +522,8 @@ unsafe fn record_rows<'a, const N: usize>(chunk: &'a [u8], mut process: impl FnM
             // Each half holds at least three separators and the full row has six.
             for rank in 0..3 {
                 offsets[rank] = _pdep_u64(1u64 << rank, low).trailing_zeros() as usize;
-                offsets[3 + rank] = shift
-                    + _pdep_u64(first_tail_rank << rank, tail).trailing_zeros() as usize;
+                offsets[3 + rank] =
+                    shift + _pdep_u64(first_tail_rank << rank, tail).trailing_zeros() as usize;
             }
         } else {
             offsets = std::array::from_fn(|rank| {
@@ -590,7 +594,11 @@ mod record_tests {
         for width in [2, 4, 7] {
             let mut input = Vec::new();
             for i in 0..1400 {
-                let field_count = if i % 7 == 0 { 1 + next() as usize % 9 } else { width };
+                let field_count = if i % 7 == 0 {
+                    1 + next() as usize % 9
+                } else {
+                    width
+                };
                 for j in 0..field_count {
                     if j != 0 {
                         input.push(b',');
@@ -600,7 +608,10 @@ mod record_tests {
                         input.push(b'"');
                     }
                     let size = if j == i % field_count && i % 3 == 0 {
-                        [0, 1, 2, 30, 31, 32, 33, 62, 63, 64, 65, 94, 95, 96, 97, 126, 127, 128, 129, 150][i % 20]
+                        [
+                            0, 1, 2, 30, 31, 32, 33, 62, 63, 64, 65, 94, 95, 96, 97, 126, 127, 128,
+                            129, 150,
+                        ][i % 20]
                     } else {
                         next() as usize % 8
                     };
